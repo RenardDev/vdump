@@ -492,6 +492,9 @@ def find_vtables_typeinfo(typeinfo):
                 offset = offset.to_bytes(4, byteorder='little', signed=False)
 
             offset = int(-1 * int.from_bytes(offset, byteorder='little', signed=True))
+            if offset < 0: # HACK: NOT GOOD! But works...
+                vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
+                continue
 
             if is_64bit:
                 if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference + 8), 0):
