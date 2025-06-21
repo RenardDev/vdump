@@ -235,9 +235,6 @@ class DeclarationConverter:
             arg = type.get_nth_arg(i)
             arg.clr_decl_const_volatile()
             args.append(self.simplify_type(arg))
-        
-        if '<' in demangled or '>' in demangled:
-            return f'virtual void TemplateStub_{idx:010}({', '.join(args)}) = 0;'
 
         if demangled.count('(') > 1:
             return f'virtual void TupleStub_{idx:010}({', '.join(args)}) = 0;'
@@ -252,6 +249,10 @@ class DeclarationConverter:
             return f'virtual ~{cls}_{offset:08X}({', '.join(args)}) = 0;'
 
         func_name = demangled.split('(')[0].split('::')[-1]
+
+        #if '<' in func_name or '>' in func_name:
+        #    return f'virtual void TemplateStub_{idx:010}({', '.join(args)}) = 0;'
+
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
         count = self.used_func_names[(cls, offset)][func_name]
