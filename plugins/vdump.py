@@ -108,6 +108,119 @@ def format_name(name):
     name = name.removesuffix('_')
     return name
 
+def normalize_tinfo(t):
+    if not t.is_correct() or not t.is_well_defined():
+        return 'void*'
+    
+    if (t.is_ptr() or
+        t.is_array() or
+        t.is_func() or
+        t.is_funcptr() or
+        t.is_sue() or
+        t.is_udt() or
+        t.is_typedef() or
+        t.is_typeref() or
+        t.is_aliased() or
+        t.is_complex() or
+        t.is_bitfield() or
+        t.is_enum() or
+        t.is_struct() or
+        t.is_union() or
+        t.is_forward_decl() or
+        t.is_forward_enum() or
+        t.is_forward_struct() or
+        t.is_forward_union() or
+        t.is_varstruct() or
+        t.is_varmember() or
+        t.is_vftable() or
+        t.is_sse_type() or
+        t.is_tbyte() or
+        t.is_unknown() or
+        t.is_decl_array() or
+        t.is_decl_bitfield() or
+        t.is_decl_complex() or
+        t.is_decl_enum() or
+        t.is_decl_func() or
+        t.is_decl_ptr() or
+        t.is_decl_struct() or
+        t.is_decl_sue() or
+        t.is_decl_typedef() or
+        t.is_decl_udt() or
+        t.is_decl_unknown() or
+        t.is_decl_paf() or
+        t.is_decl_partial() or
+        t.is_decl_tbyte() or
+        t.is_anonymous_udt() or
+        t.is_bitmask_enum() or
+        t.is_empty_enum() or
+        t.is_empty_udt() or
+        t.is_fixed_struct() or
+        t.is_from_subtil() or
+        t.is_high_func() or
+        t.is_purging_cc() or
+        t.is_shifted_ptr() or
+        t.is_small_udt() or
+        t.is_user_cc() or
+        t.is_vararg_cc() or
+        t.is_frame()):
+        return 'void*'
+
+    if t.is_void() or t.is_decl_void():
+        return 'void'
+
+    if t.is_bool() or t.is_decl_bool():
+        return 'bool'
+
+    if t.is_char() or t.is_decl_char():
+        return 'char' if t.is_signed() else 'unsigned char'
+    
+    if t.is_uchar() or t.is_decl_uchar():
+        return 'unsigned char'
+
+    if t.is_float() or t.is_decl_float():
+        return 'float'
+    
+    if t.is_double() or t.is_decl_double():
+        return 'double'
+    
+    if t.is_ldouble():
+        return 'long double'
+
+    size = t.get_size()
+    if t.is_integral() or t.is_arithmetic() or t.is_decl_arithmetic():
+        if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
+            if t.is_int16() or t.is_decl_int16():
+                return 'short'
+            if t.is_int32() or t.is_decl_int32():
+                return 'int'
+            if t.is_int64() or t.is_decl_int64():
+                return 'long long'
+            if t.is_int128() or t.is_decl_int128():
+                return 'void*'
+            if t.is_int() or t.is_decl_int():
+                return 'int' if size != 1 else 'char'
+
+            return {1: 'chat', 2: 'short', 4: 'int', 8: 'long long', 16: 'void*'}.get(size, 'int')
+
+        else:
+            if t.is_uint16() or t.is_decl_uint16():
+                return 'unsigned short'
+            if t.is_uint32() or t.is_decl_uint32():
+                return 'unsigned int'
+            if t.is_uint64() or t.is_decl_uint64():
+                return 'unsigned long long'
+            if t.is_uint128() or t.is_decl_uint128():
+                return 'void*'
+            if t.is_uint() or t.is_decl_uint():
+                return 'unsigned int' if size != 1 else 'unsigned char'
+
+            return {1: 'unsigned char', 2: 'unsigned short', 4: 'unsigned int', 8: 'unsigned long long', 16: 'void*'}.get(size, 'unsigned int')
+
+    if t.is_floating() or t.is_decl_floating():
+        return {4: 'float', 8: 'double', 10: 'long double', 16: 'long double'}.get(size, 'double')
+
+    return 'void*'
+
 class DeclarationConverter:
     def __init__(self):
         self.reset_state()
@@ -205,7 +318,7 @@ class DeclarationConverter:
             if cls not in sorted_classes:
                 forward_decls.add(f'class {cls} {{}};')
         
-        return '#include "defs.h"\n\n' + \
+        return '\n' + \
                '\n'.join(sorted(forward_decls)) + \
                '\n\n' + \
                '\n\n'.join(class_declarations)
@@ -234,7 +347,12 @@ class DeclarationConverter:
         for i in range(1, type.get_nargs()):
             arg = type.get_nth_arg(i)
             arg.clr_decl_const_volatile()
-            args.append(self.simplify_type(arg))
+            arg_str = self.simplify_type(arg)
+            if i > 1 and arg_str == 'void':
+                arg_str = 'void*'
+            elif i == 1 and type.get_nargs() > 1 and arg_str == 'void':
+                arg_str = 'void*'
+            args.append(arg_str)
 
         if demangled.count('(') > 1:
             return f'virtual void TupleStub_{idx:010}({', '.join(args)}) = 0;'
@@ -246,7 +364,7 @@ class DeclarationConverter:
             return f'virtual void NullStub_{idx:010}({', '.join(args)}) = 0;'
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'virtual ~{cls}_{offset:08X}({', '.join(args)}) = 0;'
+            return f'virtual ~{cls}_{offset:08X}() = 0;'
 
         func_name = demangled.split('(')[0].split('::')[-1]
 
@@ -260,22 +378,19 @@ class DeclarationConverter:
 
         return f'virtual {ret_str} {final_name}({', '.join(args)}) = 0;'
 
-    def get_non_pointer_type(self, tif):
-        if not tif:
-            return None
-
-        while tif.is_ptr():
-            tif = tif.get_pointed_object()
-
-        return tif
-
     def is_known_type(self, tif):
         if not tif:
             return False
 
-        tif = self.get_non_pointer_type(tif)
-        if tif and tif.get_realtype():
+        if tif.is_ptr():
             return True
+
+        tif = ida_typeinf.remove_pointer(tif)
+        if tif:
+            if tif.is_void():
+                return True
+
+            return tif.get_realtype(full=True)
 
         return False
 
@@ -285,13 +400,7 @@ class DeclarationConverter:
             
         tif.clr_decl_const_volatile()
 
-        if (tif.is_ptr() or 
-            tif.is_func() or 
-            tif.is_funcptr() or 
-            tif.is_decl_array()):
-            return 'void*'
-
-        name = tif.dstr()
+        name = normalize_tinfo(tif)
         name = name.replace('_anonymous_namespace_::', '')
         if not self.is_known_type(tif):
             name = format_name(name)
