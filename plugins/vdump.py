@@ -352,6 +352,9 @@ class DeclarationConverter:
                 arg_str = 'void*'
             args.append(arg_str)
 
+        if 'operator' in demangled:
+            return f'virtual void* OperatorStub_{idx:010}({', '.join(args)}) = 0;'
+
         if demangled.count('(') > 1:
             return f'virtual void TupleStub_{idx:010}({', '.join(args)}) = 0;'
 
@@ -372,7 +375,7 @@ class DeclarationConverter:
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
         count = self.used_func_names[(cls, offset)][func_name]
-        final_name = f'{func_name}{count}' if count > 1 else func_name
+        final_name = f'{func_name}_{count}' if count > 1 else func_name
 
         return f'virtual {ret_str} {final_name}({', '.join(args)}) = 0;'
 
