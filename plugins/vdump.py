@@ -348,9 +348,7 @@ class DeclarationConverter:
             arg = type.get_nth_arg(i)
             arg.clr_decl_const_volatile()
             arg_str = self.simplify_type(arg)
-            if i > 1 and arg_str == 'void':
-                arg_str = 'void*'
-            elif i == 1 and type.get_nargs() > 1 and arg_str == 'void':
+            if arg_str == 'void' and not (i == 1 and i == 2):
                 arg_str = 'void*'
             args.append(arg_str)
 
