@@ -1072,7 +1072,7 @@ def function_pointer_to_void_pointer_rule(node):
 def extract_function_info(decl_str):
     if not decl_str.endswith(';'):
         decl_str += ';'
-    
+
     parser = ASTParser()
     parser.add_rule(function_pointer_to_void_pointer_rule)
     try:
@@ -1271,7 +1271,10 @@ def extract_object_name(decl_str):
 
     parser = ASTParser()
     parser.add_rule(function_pointer_to_void_pointer_rule)
-    ast_nodes = parser.parse(decl_str)
+    try:
+        ast_nodes = parser.parse(decl_str)
+    except:
+        return 'void*'
 
     for node in ast_nodes:
         if isinstance(node, TypeNode):
@@ -1461,6 +1464,13 @@ class DeclarationConverter:
         tif = ida_typeinf.tinfo_t()
         if ida_typeinf.parse_decl(tif, None, str, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
             return None
+        if tif.is_ptr():
+            t = tif
+            lt = tif
+            while t and t.is_ptr():
+                lt = t
+                t = t.get_pointed_object()
+            tif = lt
         return tif
 
     def is_known_type(self, tif):
