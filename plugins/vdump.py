@@ -1219,10 +1219,6 @@ def is_builtin_type(t):
         t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
         t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
     )):
-        t = ida_typeinf.remove_pointer(t)
-        if t:
-            return True
-
         return False
 
     if t.is_void() or t.is_decl_void():
