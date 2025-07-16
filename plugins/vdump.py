@@ -1376,6 +1376,16 @@ class DeclarationConverter:
                         decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
                     
+                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
+                        if not demangled:
+                            continue
+    
+                        demangled = demangled.replace('`non-virtual thunk to\'', '')
+
+                        decl = self.process_static_function(idx, func, demangled, cls, offset)
+                        decl_lines.append(f'    // {idx:>10} - {demangled}')
+                        decl_lines.append(f'    {decl}\n')
+                    
                     decl_lines.extend([
                         '};'
                     ])
@@ -1455,6 +1465,98 @@ class DeclarationConverter:
         final_name = f'{func_name}_{count}' if count > 1 else func_name
 
         return f'virtual {ret_str} {final_name}({', '.join(args)}) = 0;'
+
+    def process_static_function(self, idx, func, demangled, cls, offset):
+
+        if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
+            return f'void static_PureStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
+            return f'void static_destructor_{cls}_{offset}_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        if '?' in demangled or '@' in demangled or '$' in demangled:
+            return f'void static_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        type = None
+
+        decompiled = ida_hexrays.decompile(func)
+        if decompiled:
+            type = decompiled.type
+            ret_type = type.get_rettype()
+            ret_type.clr_decl_const_volatile()
+            ret_str = self.simplify_type(ret_type)
+        else:
+            if f := ida_funcs.get_func(func):
+                type = f.prototype
+            ret_str = 'void'
+
+        if not type:
+            return f'void static_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        decompiled_args = []
+        for i in range(1, type.get_nargs()):
+            arg = type.get_nth_arg(i)
+            arg.clr_decl_const_volatile()
+            arg_str = self.simplify_type(arg)
+            if arg_str == 'void' and i <= 2:
+                arg_str = 'void*'
+            decompiled_args.append(arg_str)
+
+        args = decompiled_args
+
+        func_info = extract_function_info(demangled)
+        if func_info:
+            demangled_args = []
+            func_name, dargs = func_info
+            for i, arg in enumerate(dargs):
+                arg = self.parse_type(arg)
+                arg_str = 'void*'
+                if arg and is_builtin_type(arg):
+                    arg_str = dargs[i]
+                demangled_args.append(arg_str)
+            args = demangled_args
+        else:
+            func_name = demangled.split('(')[0].split('::')[-1]
+
+        if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
+            if args:
+                nargs = []
+                naargs = []
+                for i, arg in enumerate(args, start=1):
+                    nargs.append(arg + f' a{i}')
+                for i, arg in enumerate(args, start=1):
+                    naargs.append(f'a{i}')
+                return f'void static_Stub_{idx:010}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+            else:
+                return f'void static_Stub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        if demangled[:8] == 'nullsub_':
+            if args:
+                nargs = []
+                naargs = []
+                for i, arg in enumerate(args, start=1):
+                    nargs.append(arg + f' a{i}')
+                for i, arg in enumerate(args, start=1):
+                    naargs.append(f'a{i}')
+                return f'void static_NullStub__{idx:010}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+            else:
+                return f'void static_NullStub__{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
+        self.used_func_names[(cls, offset)][func_name] += 1
+        count = self.used_func_names[(cls, offset)][func_name]
+        final_name = f'{func_name}_{count}' if count > 1 else func_name
+
+        if args:
+            nargs = []
+            naargs = []
+            for i, arg in enumerate(args, start=1):
+                nargs.append(arg + f' a{i}')
+            for i, arg in enumerate(args, start=1):
+                naargs.append(f'a{i}')
+            return f'{ret_str} static_{final_name}{idx:010}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+        else:
+            return f'{ret_str} static_{final_name}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
 
     def parse_type(self, str):
         tif = ida_typeinf.tinfo_t()
