@@ -605,6 +605,79 @@ class TokenStream:
 # Parsing
 ################################################################################
 
+def _tokens_to_spelling(tokens):
+    parts = []
+    prev_kind = None
+    prev_val = None
+    for kind, val in tokens:
+        need_space = False
+        if parts:
+            # space between two WORDs / NUMBERs
+            if (prev_kind in ('WORD', 'NUMBER') and kind in ('WORD', 'NUMBER')):
+                need_space = True
+            # space before * & && if previous wasn't a symbol starting a scope
+            if kind == 'SYMBOL' and val in ('*', '&', '&&') and (prev_val not in ('::',)):
+                need_space = True
+            # space after > when next is WORD (templates)
+            if prev_val == '>' and kind in ('WORD', 'NUMBER'):
+                need_space = True
+            # collapse spaces around ::, <, >
+            if val in ('::', '>', '<'):
+                need_space = False
+            if prev_val in ('::', '<', '>'):
+                need_space = False
+        if need_space:
+            parts.append(' ')
+        parts.append(val)
+        prev_kind, prev_val = kind, val
+    return ''.join(parts)
+
+def parse_operator_function(ts):
+    """
+    Parse [scope::]* operator <operator-id or conversion-type-id> ( param-list )
+    Returns FunctionNode or None.
+    """
+    save = ts.pos
+
+    # swallow optional scope qualifiers: A::B:: ...
+    while True:
+        t1 = ts.peek()
+        t2 = ts.peek(1)
+        if t1 and t2 and t1[0] == 'WORD' and t2 == ('SYMBOL', '::'):
+            ts.next(); ts.next()
+        else:
+            break
+
+    # operator keyword
+    if not (ts.peek() and ts.peek()[0] == 'WORD' and ts.peek()[1] == 'operator'):
+        ts.pos = save
+        return None
+    ts.next()  # consume 'operator'
+
+    # Collect operator-id / conversion-type-id tokens up to the parameter '('
+    name_tokens = []
+    templ_depth = 0
+    while True:
+        tok = ts.peek()
+        if not tok:
+            ts.pos = save
+            return None
+        if tok == ('SYMBOL', '(') and templ_depth == 0:
+            break
+        if tok == ('SYMBOL', '<'):
+            templ_depth += 1
+        elif tok == ('SYMBOL', '>') and templ_depth > 0:
+            templ_depth -= 1
+        name_tokens.append(ts.next())
+
+    # Now parameter list
+    ts.expect('SYMBOL', '(')
+    params = parse_tuple_args(ts)
+    ts.expect('SYMBOL', ')')
+
+    func_name = 'operator ' + _tokens_to_spelling(name_tokens).strip()
+    return FunctionNode(return_type=None, func_name=func_name, func_template_args=[], parameters=params)
+
 def parse_declaration(ts):
     '''
     Parses a top-level declaration. If we only get a TypeNode, we return it
@@ -612,6 +685,11 @@ def parse_declaration(ts):
     This revised version does not try to “optimize away” a parenthesized argument list,
     so that the reconstructed code exactly matches the input.
     '''
+    opfn = parse_operator_function(ts)
+    if opfn:
+        ts.consume_if('SYMBOL', ';')
+        return opfn
+
     # First, parse a type with possible nesting.
     rtype = parse_type_with_nesting(ts)
     if not rtype:
@@ -1426,6 +1504,12 @@ class DeclarationConverter:
                '\n\n' + \
                '\n\n'.join(class_declarations)
 
+    def _normalize_operator_name(self, base_name: str, idx: int) -> str:
+        name = base_name.strip()
+        if name.startswith('operator'):
+            return f'operator_{idx:010}'
+        return name
+
     def process_function(self, idx, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
@@ -1471,6 +1555,7 @@ class DeclarationConverter:
         if func_info:
             demangled_args = []
             func_name, dargs = func_info
+            func_name = self._normalize_operator_name(func_name, idx)
             for i, arg in enumerate(dargs):
                 arg = self.parse_type(arg)
                 arg_str = 'void*'
@@ -1480,6 +1565,7 @@ class DeclarationConverter:
             args = demangled_args
         else:
             func_name = demangled.split('(')[0].split('::')[-1]
+            func_name = self._normalize_operator_name(func_name, idx)
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
             return f'virtual void Stub_{idx:010}({', '.join(args)}) = 0;'
@@ -1539,6 +1625,7 @@ class DeclarationConverter:
         if func_info:
             demangled_args = []
             func_name, dargs = func_info
+            func_name = self._normalize_operator_name(func_name, idx)
             func_name = 'static_' + func_name
             for i, arg in enumerate(dargs):
                 arg = self.parse_type(arg)
@@ -1549,6 +1636,7 @@ class DeclarationConverter:
             args = demangled_args
         else:
             func_name = demangled.split('(')[0].split('::')[-1]
+            func_name = self._normalize_operator_name(func_name, idx)
             func_name = 'static_' + func_name
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
@@ -1622,9 +1710,11 @@ class DeclarationConverter:
         func_info = extract_function_info(demangled)
         if func_info:
             func_name, _ = func_info
+            func_name = self._normalize_operator_name(func_name, idx)
             func_name = 'get_' + func_name
         else:
             func_name = demangled.split('(')[0].split('::')[-1]
+            func_name = self._normalize_operator_name(func_name, idx)
             func_name = 'get_' + func_name
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
