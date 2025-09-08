@@ -874,31 +874,32 @@ def is_function_pointer(ts):
     return False
 
 def parse_function_pointer(ts, namespaces, base_typename, targs, leading_mods):
-    # Only attempt to parse a function pointer if the tokens ahead match the pattern.
     if not is_function_pointer(ts):
         return None
 
-    # Now that we know it's a function pointer, actually consume the tokens.
-    ts.next()  # consume '('
+    ts.next()  # '('
     calling_convention = None
     if ts.peek() and ts.peek()[0] == 'WORD' and ts.peek()[1] in {'__cdecl', '__stdcall', '__fastcall', '__vectorcall'}:
         calling_convention = ts.next()[1]
     if not ts.consume_if('SYMBOL', '*'):
-        # Should not happen because of our check, but just in case, rewind.
         return None
     if not ts.consume_if('SYMBOL', ')'):
-        raise ParserError('Expected \')\' after function pointer '*'.')
+        raise ParserError("Expected ')' after function pointer '*'.")
     if not ts.consume_if('SYMBOL', '('):
-        raise ParserError('Expected \'(\' to start function pointer parameter list.')
+        raise ParserError("Expected '(' to start function pointer parameter list.")
     parameters = parse_tuple_args(ts)
     ts.expect('SYMBOL', ')')
-    fp_node = FunctionPointerNode(
-        return_type=TypeNode(typename=base_typename),
+
+    return FunctionPointerNode(
+        return_type=TypeNode(
+            namespaces=namespaces,
+            typename=base_typename,
+            template_args=targs,
+            leading_mods=leading_mods
+        ),
         calling_convention=calling_convention,
         parameters=parameters
     )
-    return fp_node
-
 
 def parse_template_args(ts):
     '''
@@ -1056,7 +1057,6 @@ class ASTParser:
                 break
         return ast_nodes
 
-
 ################################################################################
 # vdump
 ################################################################################
@@ -1081,17 +1081,31 @@ def extract_function_info(decl_str):
         return None
 
     for node in ast_nodes:
+        # Function type (e.g., "Ret NS::Cls::f(T1, T2)")
+        if isinstance(node, FunctionNode):
+            params = []
+            for p in node.parameters:
+                s = to_code(p, top_level=False)
+                if s == 'void' and len(node.parameters) == 1:
+                    break
+                elif s == 'void' and len(node.parameters) > 1:
+                    s = 'void*'
+                params.append(s)
+            func_name = node.func_name or (node.return_type.typename if node.return_type else '')
+            return (func_name, params)
+
+        # Type with tuple args (e.g., "void(int, float)")
         if isinstance(node, TypeNode):
             params = []
-            for param in node.tuple_args:
-                param_str = to_code(param, top_level=False)
-                if param_str == 'void' and len(node.tuple_args) == 1:
+            for p in node.tuple_args:
+                s = to_code(p, top_level=False)
+                if s == 'void' and len(node.tuple_args) == 1:
                     break
-                elif param_str == 'void' and len(node.tuple_args) > 1:
-                    param_str = 'void*'
-                params.append(param_str)
+                elif s == 'void' and len(node.tuple_args) > 1:
+                    s = 'void*'
+                params.append(s)
             return (node.typename, params)
-    
+
     return None
 
 def format_name(name):
@@ -1376,16 +1390,26 @@ class DeclarationConverter:
                         decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
                     
-                    if offset != 0:
-                        for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
-                            if not demangled:
-                                continue
-        
-                            demangled = demangled.replace('`non-virtual thunk to\'', '')
+                    #if offset != 0:
+                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
+                        if not demangled:
+                            continue
+    
+                        demangled = demangled.replace('`non-virtual thunk to\'', '')
 
-                            decl = self.process_static_function(idx, func, demangled, cls, offset)
-                            decl_lines.append(f'    // {idx:>10} - {demangled}')
-                            decl_lines.append(f'    {decl}\n')
+                        decl = self.process_static_function(idx, func, demangled, cls, offset)
+                        decl_lines.append(f'    // {idx:>10} - {demangled}')
+                        decl_lines.append(f'    {decl}\n')
+
+                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
+                        if not demangled:
+                            continue
+    
+                        demangled = demangled.replace('`non-virtual thunk to\'', '')
+
+                        decl = self.process_get_function(idx, func, demangled, cls, offset)
+                        decl_lines.append(f'    // {idx:>10} - {demangled}')
+                        decl_lines.append(f'    {decl}\n')
                     
                     decl_lines.extend([
                         '};'
@@ -1415,7 +1439,10 @@ class DeclarationConverter:
 
         type = None
 
-        decompiled = ida_hexrays.decompile(func)
+        try:
+            decompiled = ida_hexrays.decompile(func)
+        except Exception:
+            decompiled = None
         if decompiled:
             type = decompiled.type
             ret_type = type.get_rettype()
@@ -1480,7 +1507,10 @@ class DeclarationConverter:
 
         type = None
 
-        decompiled = ida_hexrays.decompile(func)
+        try:
+            decompiled = ida_hexrays.decompile(func)
+        except Exception:
+            decompiled = None
         if decompiled:
             type = decompiled.type
             ret_type = type.get_rettype()
@@ -1560,6 +1590,55 @@ class DeclarationConverter:
             return f'static {ret_str} {final_name}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return reinterpret_cast<{ret_str}(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
         else:
             return f'static {ret_str} {final_name}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return reinterpret_cast<{ret_str}(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+
+    def process_get_function(self, idx, func, demangled, cls, offset):
+
+        if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
+            return f'static void* get_PureStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+
+        if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
+            return f'static void* get_destructor_{cls}_{offset:08X}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+
+        if '?' in demangled or '@' in demangled or '$' in demangled:
+            return f'static void* get_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+
+        type = None
+
+        try:
+            decompiled = ida_hexrays.decompile(func)
+        except Exception:
+            decompiled = None
+        if decompiled:
+            type = decompiled.type
+            ret_type = type.get_rettype()
+            ret_type.clr_decl_const_volatile()
+        else:
+            if f := ida_funcs.get_func(func):
+                type = f.prototype
+
+        if not type:
+            return f'static void* get_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+
+        func_info = extract_function_info(demangled)
+        if func_info:
+            func_name, _ = func_info
+            func_name = 'get_' + func_name
+        else:
+            func_name = demangled.split('(')[0].split('::')[-1]
+            func_name = 'get_' + func_name
+
+        if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
+            return f'static void* get_Stub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}];}};'
+
+        if demangled[:8] == 'nullsub_':
+            return f'static void* get_NullStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+
+        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
+        self.used_func_names[(cls, offset)][func_name] += 1
+        count = self.used_func_names[(cls, offset)][func_name]
+        final_name = f'{func_name}_{count}' if count > 1 else func_name
+
+        return f'static void* {final_name}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
 
     def parse_type(self, str):
         tif = ida_typeinf.tinfo_t()
@@ -1691,8 +1770,11 @@ def find_type_infos():
                     continue
 
                 name = ida_bytes.get_strlit_contents(name_address, -1, 0)
+                if not name:
+                    type_reference = ida_xref.get_next_dref_to(type_address, type_reference)
+                    continue
 
-                name = name.decode()
+                name = name.decode(errors='ignore')
                 demangled_name = ida_name.demangle_name('__ZTI' + name, ida_name.MNG_NOECSU | ida_name.MNG_ZPT_SPACE)
                 if not demangled_name:
                     type_reference = ida_xref.get_next_dref_to(type_address, type_reference)
@@ -2219,9 +2301,9 @@ class vdump_t(ida_idaapi.plugin_t):
 
         converter = DeclarationConverter()
         output = converter.convert(trees, class_vfuncs)
-        path = Path(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
-        output_path = path.stem + '.h'
-        with open(output_path, 'w') as f:
+        idb_path = Path(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
+        output_path = idb_path.with_suffix('.h')
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(output)
         print_message(f'NOTE: VTable declarations written to {output_path}')
 
