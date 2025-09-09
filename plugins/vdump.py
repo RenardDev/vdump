@@ -1468,7 +1468,6 @@ class DeclarationConverter:
                         decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
                     
-                    #if offset != 0:
                     for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
                         if not demangled:
                             continue
@@ -1476,7 +1475,7 @@ class DeclarationConverter:
                         demangled = demangled.replace('`non-virtual thunk to\'', '')
 
                         decl = self.process_static_function(idx, func, demangled, cls, offset)
-                        decl_lines.append(f'    // {idx:>10} - {demangled}')
+                        #decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
 
                     for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
@@ -1486,7 +1485,7 @@ class DeclarationConverter:
                         demangled = demangled.replace('`non-virtual thunk to\'', '')
 
                         decl = self.process_get_function(idx, func, demangled, cls, offset)
-                        decl_lines.append(f'    // {idx:>10} - {demangled}')
+                        #decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
                     
                     decl_lines.extend([
