@@ -1467,7 +1467,7 @@ class DeclarationConverter:
                         decl = self.process_function(idx, func, demangled, cls, offset)
                         decl_lines.append(f'    // {idx:>10} - {demangled}')
                         decl_lines.append(f'    {decl}\n')
-                    
+
                     for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
                         if not demangled:
                             continue
@@ -1476,7 +1476,9 @@ class DeclarationConverter:
 
                         decl = self.process_static_function(idx, func, demangled, cls, offset)
                         #decl_lines.append(f'    // {idx:>10} - {demangled}')
-                        decl_lines.append(f'    {decl}\n')
+                        decl_lines.append(f'    {decl}')
+
+                    decl_lines.append('')
 
                     for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
                         if not demangled:
@@ -1486,7 +1488,7 @@ class DeclarationConverter:
 
                         decl = self.process_get_function(idx, func, demangled, cls, offset)
                         #decl_lines.append(f'    // {idx:>10} - {demangled}')
-                        decl_lines.append(f'    {decl}\n')
+                        decl_lines.append(f'    {decl}')
                     
                     decl_lines.extend([
                         '};'
@@ -1582,13 +1584,13 @@ class DeclarationConverter:
     def process_static_function(self, idx, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return f'static void static_PureStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+            return f'static void static_PureStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'static void static_destructor_{cls}_{offset:08X}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+            return f'static void static_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         if '?' in demangled or '@' in demangled or '$' in demangled:
-            return f'static void static_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+            return f'static void static_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         type = None
 
@@ -1607,7 +1609,7 @@ class DeclarationConverter:
             ret_str = 'void'
 
         if not type:
-            return f'static void static_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+            return f'static void static_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         decompiled_args = []
         for i in range(1, type.get_nargs()):
@@ -1646,9 +1648,9 @@ class DeclarationConverter:
                     nargs.append(arg + f' a{i}')
                 for i, arg in enumerate(args, start=1):
                     naargs.append(f'a{i}')
-                return f'static void static_Stub_{idx:010}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+                return f'static void static_Stub_{idx:010}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
             else:
-                return f'static void static_Stub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+                return f'static void static_Stub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         if demangled[:8] == 'nullsub_':
             if args:
@@ -1658,9 +1660,9 @@ class DeclarationConverter:
                     nargs.append(arg + f' a{i}')
                 for i, arg in enumerate(args, start=1):
                     naargs.append(f'a{i}')
-                return f'static void static_NullStub_{idx:010}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+                return f'static void static_NullStub_{idx:010}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
             else:
-                return f'static void static_NullStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+                return f'static void static_NullStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
@@ -1674,20 +1676,20 @@ class DeclarationConverter:
                 nargs.append(arg + f' a{i}')
             for i, arg in enumerate(args, start=1):
                 naargs.append(f'a{i}')
-            return f'static {ret_str} {final_name}(void* pThis, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return reinterpret_cast<{ret_str}(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx}])(pThis, {', '.join(naargs)}); }};'
+            return f'static {ret_str} {final_name}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
         else:
-            return f'static {ret_str} {final_name}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return reinterpret_cast<{ret_str}(__thiscall*)(void*)>(pVTable[{idx}])(pThis); }};'
+            return f'static {ret_str} {final_name}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
 
     def process_get_function(self, idx, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return f'static void* get_PureStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+            return f'static void* get_PureStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'static void* get_destructor_{cls}_{offset:08X}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+            return f'static void* get_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
         if '?' in demangled or '@' in demangled or '$' in demangled:
-            return f'static void* get_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+            return f'static void* get_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
         type = None
 
@@ -1704,7 +1706,7 @@ class DeclarationConverter:
                 type = f.prototype
 
         if not type:
-            return f'static void* get_InvalidStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+            return f'static void* get_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
         func_info = extract_function_info(demangled)
         if func_info:
@@ -1717,17 +1719,17 @@ class DeclarationConverter:
             func_name = 'get_' + func_name
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            return f'static void* get_Stub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}];}};'
+            return f'static void* get_Stub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset];}};'
 
         if demangled[:8] == 'nullsub_':
-            return f'static void* get_NullStub_{idx:010}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+            return f'static void* get_NullStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
         count = self.used_func_names[(cls, offset)][func_name]
         final_name = f'{func_name}_{count}' if count > 1 else func_name
 
-        return f'static void* {final_name}(void* pThis) {{ void** pVTable = *reinterpret_cast<void***>(reinterpret_cast<char*>(pThis) + {offset:#x}); return pVTable[{idx}]; }};'
+        return f'static void* {final_name}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
 
     def parse_type(self, str):
         tif = ida_typeinf.tinfo_t()
