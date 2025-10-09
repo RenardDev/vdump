@@ -1395,11 +1395,11 @@ class DeclarationConverter:
     def convert(self, trees, class_vfuncs):
         self.reset_state()
         self.class_vfuncs = class_vfuncs
-        
+
         for tree in trees:
             if tree is not None:
                 self.process_tree(tree)
-                
+
         return self.generate_declarations()
 
     def process_tree(self, root_node):
@@ -1426,10 +1426,75 @@ class DeclarationConverter:
             for base in base_names:
                 self.reverse_graph.setdefault(base, []).append(class_name)
             self.in_degree[class_name] = len(base_names)
-            
+
             for base in base_names:
                 if base not in self.in_degree:
                     self.in_degree[base] = 0
+
+    def _canon_arg(self, arg_str):
+        tif = self.parse_type(arg_str)
+        if tif and is_builtin_type(tif):
+            return arg_str
+        return 'void*'
+
+    def _key_for_compare(self, idx, func, demangled, cls, offset):
+        d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
+
+        if d.startswith('~') or '::~' in d or 'destructor' in d:
+            return None
+
+        if d[:19] == '___cxa_pure_virtual' or d[:10] == '__purecall':
+            return None
+        if '?' in d or '@' in d or '$' in d:
+            return None
+        if d.startswith('nullsub_'):
+            return None
+
+        fi = extract_function_info(d)
+        if fi:
+            base_name, dargs = fi
+            base_name = base_name.strip()
+            norm_args = tuple(self._canon_arg(a) for a in dargs)
+            return (base_name, norm_args)
+
+        base_name = d.split('(')[0].split('::')[-1].strip()
+        return (base_name, ())
+
+    def _collect_key_counts_from_nonzero_offsets(self, cls):
+        if ida_ida.inf_get_filetype() != ida_ida.f_MACHO:
+            return collections.Counter()
+
+        cnt = collections.Counter()
+        offmap = self.class_vfuncs.get(cls, {})
+        for off, lst in offmap.items():
+            if off == 0:
+                continue
+            for i, (ea, dem) in enumerate(lst):
+                if not dem:
+                    continue
+                dem2 = dem.replace('`non-virtual thunk to\'', '')
+                key = self._key_for_compare(i, ea, dem2, cls, off)
+                if key:
+                    cnt[key] += 1
+        return cnt
+
+    def _enumerate_vfuncs_filtered(self, cls, offset, vfuncs, other_counts):
+        if ida_ida.inf_get_filetype() != ida_ida.f_MACHO or offset != 0:
+            return [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+
+        out = []
+        logical = 0
+        for phys_i, (ea, dem) in enumerate(vfuncs):
+            if not dem:
+                continue
+            dem2 = dem.replace('`non-virtual thunk to\'', '')
+            key = self._key_for_compare(phys_i, ea, dem2, cls, offset)
+            if key and other_counts.get(key, 0) > 0:
+                other_counts[key] -= 1
+                continue
+            out.append((logical, phys_i, ea, dem))
+            logical += 1
+        return out
 
     def generate_declarations(self):
         queue = collections.deque([cls for cls, deg in self.in_degree.items() if deg == 0])
@@ -1444,68 +1509,67 @@ class DeclarationConverter:
 
         class_declarations = []
         class_name_map = {}
-        
+
         for cls in sorted_classes:
-            if cls in self.class_vfuncs:
-                for offset in self.class_vfuncs[cls]:
-                    offset_name = f'{cls}_{offset:08X}'
-                    class_name_map[(cls, offset)] = offset_name
+            if cls not in self.class_vfuncs:
+                continue
 
-                    self.forward_decls.add(f'class {offset_name}; // OFFSET: {offset:08X}')
-                    
-                    decl_lines = [
-                        f'class {offset_name} {{ // OFFSET: {offset:08X}',
-                        'public:'
-                    ]
-                    
-                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
-                        if not demangled:
-                            continue
-    
-                        demangled = demangled.replace('`non-virtual thunk to\'', '')
+            other_counts = self._collect_key_counts_from_nonzero_offsets(cls)
 
-                        decl = self.process_function(idx, func, demangled, cls, offset)
-                        decl_lines.append(f'    // {idx:>10} - {demangled}')
-                        decl_lines.append(f'    {decl}\n')
+            for offset in self.class_vfuncs[cls]:
+                offset_name = f'{cls}_{offset:08X}'
+                class_name_map[(cls, offset)] = offset_name
 
-                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
-                        if not demangled:
-                            continue
-    
-                        demangled = demangled.replace('`non-virtual thunk to\'', '')
+                self.forward_decls.add(f'class {offset_name}; // OFFSET: {offset:08X}')
 
-                        decl = self.process_static_function(idx, func, demangled, cls, offset)
-                        #decl_lines.append(f'    // {idx:>10} - {demangled}')
-                        decl_lines.append(f'    {decl}')
+                decl_lines = [
+                    f'class {offset_name} {{ // OFFSET: {offset:08X}',
+                    'public:'
+                ]
 
-                    decl_lines.append('')
+                vfuncs = self.class_vfuncs[cls][offset]
+                filtered = self._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
 
-                    for idx, (func, demangled) in enumerate(self.class_vfuncs[cls][offset]):
-                        if not demangled:
-                            continue
-    
-                        demangled = demangled.replace('`non-virtual thunk to\'', '')
+                for log_i, phys_i, func, demangled in filtered:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_function(log_i, func, d2, cls, offset)
+                    decl_lines.append(f'    // {log_i:>10} - {d2}')
+                    decl_lines.append(f'    {decl}\n')
 
-                        decl = self.process_get_function(idx, func, demangled, cls, offset)
-                        #decl_lines.append(f'    // {idx:>10} - {demangled}')
-                        decl_lines.append(f'    {decl}')
-                    
-                    decl_lines.extend([
-                        '};'
-                    ])
-                    
-                    class_declarations.append('\n'.join(decl_lines))
-        
+                for log_i, phys_i, func, demangled in filtered:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset)
+                    decl_lines.append(f'    {decl}')
+
+                decl_lines.append('')
+
+                for log_i, phys_i, func, demangled in filtered:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset)
+                    decl_lines.append(f'    {decl}')
+
+                decl_lines.extend([
+                    '};'
+                ])
+
+                class_declarations.append('\n'.join(decl_lines))
+
         for cls in self.declare:
             if cls not in sorted_classes:
                 self.forward_decls.add(f'class {cls} {{}};')
-        
+
         return '\n' + \
                '\n'.join(sorted(self.forward_decls)) + \
                '\n\n' + \
                '\n\n'.join(class_declarations)
 
-    def _normalize_operator_name(self, base_name: str, idx: int) -> str:
+    def _normalize_operator_name(self, base_name, idx):
         name = base_name.strip()
         if name.startswith('operator'):
             return f'operator_{idx:010}'
@@ -1557,10 +1621,10 @@ class DeclarationConverter:
             demangled_args = []
             func_name, dargs = func_info
             func_name = self._normalize_operator_name(func_name, idx)
-            for i, arg in enumerate(dargs):
-                arg = self.parse_type(arg)
+            for i, a in enumerate(dargs):
+                tif = self.parse_type(a)
                 arg_str = 'void*'
-                if arg and is_builtin_type(arg):
+                if tif and is_builtin_type(tif):
                     arg_str = dargs[i]
                 demangled_args.append(arg_str)
             args = demangled_args
@@ -1569,28 +1633,40 @@ class DeclarationConverter:
             func_name = self._normalize_operator_name(func_name, idx)
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            return f'virtual void Stub_{idx:010}({', '.join(args)}) = 0;'
+            return f'virtual void Stub_{idx:010}({", ".join(args)}) = 0;'
 
         if demangled[:8] == 'nullsub_':
-            return f'virtual void NullStub_{idx:010}({', '.join(args)}) = 0;'
+            return f'virtual void NullStub_{idx:010}({", ".join(args)}) = 0;'
 
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
         count = self.used_func_names[(cls, offset)][func_name]
         final_name = f'{func_name}_{count}' if count > 1 else func_name
 
-        return f'virtual {ret_str} {final_name}({', '.join(args)}) = 0;'
+        return f'virtual {ret_str} {final_name}({", ".join(args)}) = 0;'
 
-    def process_static_function(self, idx, func, demangled, cls, offset):
+    def process_static_function(self, idx_logical, idx_callslot, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return f'static void static_PureStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+            return (
+                f'static void static_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+            )
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'static void static_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+            return (
+                f'static void static_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+            )
 
         if '?' in demangled or '@' in demangled or '$' in demangled:
-            return f'static void static_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+            return (
+                f'static void static_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+            )
 
         type = None
 
@@ -1609,7 +1685,11 @@ class DeclarationConverter:
             ret_str = 'void'
 
         if not type:
-            return f'static void static_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+            return (
+                f'static void static_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+            )
 
         decompiled_args = []
         for i in range(1, type.get_nargs()):
@@ -1626,43 +1706,53 @@ class DeclarationConverter:
         if func_info:
             demangled_args = []
             func_name, dargs = func_info
-            func_name = self._normalize_operator_name(func_name, idx)
+            func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'static_' + func_name
-            for i, arg in enumerate(dargs):
-                arg = self.parse_type(arg)
+            for i, a in enumerate(dargs):
+                tif = self.parse_type(a)
                 arg_str = 'void*'
-                if arg and is_builtin_type(arg):
+                if tif and is_builtin_type(tif):
                     arg_str = dargs[i]
                 demangled_args.append(arg_str)
             args = demangled_args
         else:
             func_name = demangled.split('(')[0].split('::')[-1]
-            func_name = self._normalize_operator_name(func_name, idx)
+            func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'static_' + func_name
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
             if args:
-                nargs = []
-                naargs = []
-                for i, arg in enumerate(args, start=1):
-                    nargs.append(arg + f' a{i}')
-                for i, arg in enumerate(args, start=1):
-                    naargs.append(f'a{i}')
-                return f'static void static_Stub_{idx:010}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
+                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+                return (
+                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_callslot} + nFixOffset])'
+                    f'(pThis, {", ".join(naargs)}); }};'
+                )
             else:
-                return f'static void static_Stub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+                return (
+                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+                )
 
         if demangled[:8] == 'nullsub_':
             if args:
-                nargs = []
-                naargs = []
-                for i, arg in enumerate(args, start=1):
-                    nargs.append(arg + f' a{i}')
-                for i, arg in enumerate(args, start=1):
-                    naargs.append(f'a{i}')
-                return f'static void static_NullStub_{idx:010}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
+                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+                return (
+                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_callslot} + nFixOffset])'
+                    f'(pThis, {", ".join(naargs)}); }};'
+                )
             else:
-                return f'static void static_NullStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+                return (
+                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+                )
 
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
@@ -1670,29 +1760,46 @@ class DeclarationConverter:
         final_name = f'{func_name}_{count}' if count > 1 else func_name
 
         if args:
-            nargs = []
-            naargs = []
-            for i, arg in enumerate(args, start=1):
-                nargs.append(arg + f' a{i}')
-            for i, arg in enumerate(args, start=1):
-                naargs.append(f'a{i}')
-            return f'static {ret_str} {final_name}(void* pThis, int nFixOffset, {', '.join(nargs)}) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*, {', '.join(args)})>(pVTable[{idx} + nFixOffset])(pThis, {', '.join(naargs)}); }};'
+            nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+            naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+            return (
+                f'static {ret_str} {final_name}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*, {", ".join(args)})>'
+                f'(pVTable[{idx_callslot} + nFixOffset])(pThis, {", ".join(naargs)}); }};'
+            )
         else:
-            return f'static {ret_str} {final_name}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return reinterpret_cast<{ret_str}(__thiscall*)(void*)>(pVTable[{idx} + nFixOffset])(pThis); }};'
+            return (
+                f'static {ret_str} {final_name}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*)>'
+                f'(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
+            )
 
-    def process_get_function(self, idx, func, demangled, cls, offset):
+    def process_get_function(self, idx_logical, idx_callslot, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return f'static void* get_PureStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+            return (
+                f'static void* get_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'static void* get_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+            return (
+                f'static void* get_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         if '?' in demangled or '@' in demangled or '$' in demangled:
-            return f'static void* get_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+            return (
+                f'static void* get_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         type = None
-
         try:
             decompiled = ida_hexrays.decompile(func)
         except Exception:
@@ -1706,34 +1813,50 @@ class DeclarationConverter:
                 type = f.prototype
 
         if not type:
-            return f'static void* get_InvalidStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+            return (
+                f'static void* get_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         func_info = extract_function_info(demangled)
         if func_info:
             func_name, _ = func_info
-            func_name = self._normalize_operator_name(func_name, idx)
+            func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'get_' + func_name
         else:
             func_name = demangled.split('(')[0].split('::')[-1]
-            func_name = self._normalize_operator_name(func_name, idx)
+            func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'get_' + func_name
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            return f'static void* get_Stub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset];}};'
+            return (
+                f'static void* get_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         if demangled[:8] == 'nullsub_':
-            return f'static void* get_NullStub_{idx:010}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+            return (
+                f'static void* get_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+            )
 
         self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
         self.used_func_names[(cls, offset)][func_name] += 1
         count = self.used_func_names[(cls, offset)][func_name]
         final_name = f'{func_name}_{count}' if count > 1 else func_name
 
-        return f'static void* {final_name}(void* pThis, int nFixOffset) {{ void** pVTable = *reinterpret_cast<void***>(pThis); return pVTable[{idx} + nFixOffset]; }};'
+        return (
+            f'static void* {final_name}(void* pThis, int nFixOffset) {{ '
+            f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+            f'return pVTable[{idx_callslot} + nFixOffset]; }};'
+        )
 
-    def parse_type(self, str):
+    def parse_type(self, s):
         tif = ida_typeinf.tinfo_t()
-        if ida_typeinf.parse_decl(tif, None, str, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
+        if ida_typeinf.parse_decl(tif, None, s, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
             return None
         if tif.is_ptr():
             t = tif
@@ -1755,7 +1878,6 @@ class DeclarationConverter:
         if tif:
             if tif.is_void():
                 return True
-
             return tif.get_realtype(full=True)
 
         return False
@@ -1763,7 +1885,7 @@ class DeclarationConverter:
     def simplify_type(self, tif):
         if not tif:
             return 'void'
-            
+
         tif.clr_decl_const_volatile()
 
         name = normalize_tinfo(tif)
