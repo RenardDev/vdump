@@ -1,6 +1,6 @@
 
 # Name: vdump.py
-# Version: 1.0.0
+# Version: 3.0.0
 # Author: RenardDev (zeze839@gmail.com)
 
 # --------------------
@@ -50,6 +50,8 @@ import ida_hexrays
 import ida_idc
 import ida_typeinf
 import ida_loader
+
+DUMP_FOR_SOURCE_PYTHON = True
 
 ################################################################################
 # Base functions
@@ -110,10 +112,6 @@ class BaseNode:
         return ' ' * indent + '<BaseNode>'
 
 class TypeNode(BaseNode):
-    '''
-    Represents a (possibly) qualified type with optional template args,
-    modifiers, nested ::, etc.
-    '''
     def __init__(
         self,
         namespaces=None,
@@ -165,42 +163,35 @@ class TypeNode(BaseNode):
         lines = []
         curr = indent
 
-        # Show namespaces
         for ns in self.namespaces:
             lines.append(' ' * curr + f'namespace: {ns}')
             curr += 4
 
-        # Show main typename with modifiers
         if self.leading_mods or self.typename:
             if any(mod in {'class', 'struct', 'enum'} for mod in self.leading_mods):
-                # Extract the modifier
                 mods = ' '.join(self.leading_mods) if self.leading_mods else ''
                 if self.typename:
                     lines.append(' ' * curr + f'{mods}: {self.typename}')
             else:
                 if self.leading_mods:
-                    lines.append(' ' * curr + f'leading_mods: {', '.join(self.leading_mods)}')
+                    lines.append(' ' * curr + 'leading_mods: ' + ', '.join(self.leading_mods))
                     curr += 4
                 if self.typename:
                     lines.append(' ' * curr + f'type: {self.typename}')
 
-        # Template args
         if self.template_args:
             lines.append(' ' * (curr + 4) + 'template arguments:')
             for arg in self.template_args:
                 lines.append(arg.__str__(curr + 8))
 
-        # Trailing mods
         if self.trailing_mods:
-            lines.append(' ' * (curr + 4) + f'trailing_mods: {', '.join(self.trailing_mods)}')
+            lines.append(' ' * (curr + 4) + 'trailing_mods: ' + ', '.join(self.trailing_mods))
 
-        # Tuple args (like function param style)
         if self.tuple_args:
             lines.append(' ' * (curr + 4) + 'tuple arguments:')
             for p in self.tuple_args:
                 lines.append(p.__str__(curr + 8))
 
-        # Special suffix
         if self.special_suffix:
             lines.append(' ' * (curr + 4) + f'suffix: {self.special_suffix}')
 
@@ -209,17 +200,12 @@ class TypeNode(BaseNode):
         if self.has_template_keyword:
             lines.append(' ' * (curr + 4) + 'has_template_keyword: True')
 
-        # Nested types
         for nt in self.nested_types:
             lines.append(nt.__str__(curr + 4))
 
         return '\n'.join(lines)
 
 class FunctionPointerNode(BaseNode):
-    '''
-    Represents a function pointer type with return type, calling convention,
-    trailing modifiers, and parameters.
-    '''
     def __init__(self, return_type=None, calling_convention=None, parameters=None, trailing_mods=None):
         super().__init__()
         self.return_type = return_type
@@ -249,20 +235,18 @@ class FunctionPointerNode(BaseNode):
             for p in self.parameters:
                 lines.append(p.__str__(indent + 8))
         if self.trailing_mods:
-            lines.append(' ' * (indent + 4) + f'trailing_mods: {', '.join(self.trailing_mods)}')
+            lines.append(' ' * (indent + 4) + 'trailing_mods: ' + ', '.join(self.trailing_mods))
         return '\n'.join(lines)
 
 class ValueNode(BaseNode):
-    '''Represents a numeric literal (e.g. 42).'''
     def __init__(self, value):
         super().__init__()
         self.value = value
 
     def __str__(self, indent=0):
-        return f'{' ' * indent}value: {self.value}'
+        return ' ' * indent + f'value: {self.value}'
 
 class EllipsisNode(BaseNode):
-    '''Represents the ellipsis '...' used as a placeholder in template args.'''
     def __init__(self):
         super().__init__()
 
@@ -270,9 +254,6 @@ class EllipsisNode(BaseNode):
         return ' ' * indent + '...'
 
 class ParameterNode(BaseNode):
-    '''
-    A function or constructor parameter, like (int x) or (0).
-    '''
     def __init__(self, type_node=None, param_name=None, value_node=None):
         super().__init__()
         self.type_node = type_node
@@ -365,52 +346,40 @@ class FunctionNode(BaseNode):
 ################################################################################
 
 def to_code(node, top_level=False):
-    '''
-    Convert an AST node back to a synthetic code-like string, with semicolon if top_level.
-    '''
-
     if node is None:
         return ''
 
-    # 1. FunctionPointerNode
     if isinstance(node, FunctionPointerNode):
         parts = []
         if node.return_type:
             parts.append(to_code(node.return_type, top_level=False))
         if node.calling_convention:
             parts.append(node.calling_convention)
-        # Enclose calling convention and '*' in parentheses
         if node.calling_convention:
             fp_str = f'{parts[0]}({parts[1]}*)'
         else:
             fp_str = f'{parts[0]}(*)'
         params = ', '.join(to_code(p, top_level=False) for p in node.parameters)
         fp_str += f'({params})'
-        # Append trailing mods if any
         if node.trailing_mods:
             fp_str += ''.join(node.trailing_mods)
         return fp_str
 
-    # 2. Numeric literal
     if isinstance(node, ValueNode):
         return str(node.value)
 
-    # 3. Ellipsis
     if isinstance(node, EllipsisNode):
         return '...'
 
-    # 4. Parameter
     if isinstance(node, ParameterNode):
         if node.value_node:
             return to_code(node.value_node, top_level=False)
         param_type = to_code(node.type_node, top_level=False)
         return f'{param_type} {node.param_name}' if node.param_name else param_type
 
-    # 5. TypeNode
     if isinstance(node, TypeNode):
         parts = []
 
-        # Leading mods (merge pointers/references)
         leading_parts = []
         ptr_ref_tokens = {'*', '&', '&&'}
         for m in node.leading_mods:
@@ -427,7 +396,6 @@ def to_code(node, top_level=False):
 
         leading_part = ' '.join(leading_parts)
 
-        # 'typename' prefix
         if node.has_typename_prefix:
             if leading_part:
                 parts.append(f'typename {leading_part}')
@@ -437,7 +405,6 @@ def to_code(node, top_level=False):
             if leading_part:
                 parts.append(leading_part)
 
-        # namespaces
         ns_part = '::'.join(node.namespaces)
         if ns_part:
             if parts:
@@ -448,7 +415,6 @@ def to_code(node, top_level=False):
             else:
                 parts.append(ns_part + '::')
 
-        # base typename
         base_name = node.typename or ''
         if node.has_template_keyword and base_name:
             base_name = 'template ' + base_name
@@ -462,18 +428,14 @@ def to_code(node, top_level=False):
             else:
                 parts.append(base_name)
 
-        # <template args>
         if node.template_args:
             inside_args = [to_code(a, top_level=False) for a in node.template_args]
-            # join with commas
             parts[-1] += '<' + ', '.join(inside_args) + '>'
 
-        # (tuple args)
         if node.tuple_args:
             inside_pars = ', '.join(to_code(p, top_level=False) for p in node.tuple_args)
             parts[-1] += '(' + inside_pars + ')'
 
-        # trailing mods
         for m in node.trailing_mods:
             if m in ptr_ref_tokens:
                 if parts:
@@ -486,7 +448,6 @@ def to_code(node, top_level=False):
                 else:
                     parts.append(m)
 
-        # special suffix
         if node.special_suffix:
             if parts:
                 parts[-1] += '::' + node.special_suffix
@@ -495,7 +456,6 @@ def to_code(node, top_level=False):
 
         base_str = ''.join(parts).strip()
 
-        # Nested types
         for nt in node.nested_types:
             nt_str = to_code(nt, top_level=False)
             base_str += f'::{nt_str}'
@@ -504,7 +464,6 @@ def to_code(node, top_level=False):
             base_str += ';'
         return base_str
 
-    # 6. VariableNode
     if isinstance(node, VariableNode):
         t = to_code(node.type_node, top_level=False)
         v = node.var_name or ''
@@ -513,7 +472,6 @@ def to_code(node, top_level=False):
             out += ';'
         return out
 
-    # 7. FunctionNode
     if isinstance(node, FunctionNode):
         rt = to_code(node.return_type, top_level=False)
         fn = node.func_name or ''
@@ -539,7 +497,6 @@ def to_code(node, top_level=False):
 
 TOKEN_PATTERN = re.compile(
     r'''
-    # Match words, numbers, &&, ellipsis, etc.
     (?P<word>[A-Za-z_]\w*)
     |(?P<number>\d+)
     |(?P<dbl_and>\&\&)
@@ -605,6 +562,58 @@ class TokenStream:
 # Parsing
 ################################################################################
 
+_BUILTIN_COMBOS = [
+    ('unsigned', 'long', 'long', 'int'),
+    ('signed',   'long', 'long', 'int'),
+    ('unsigned', 'short', 'int'),
+    ('signed',   'short', 'int'),
+    ('unsigned', 'long',  'int'),
+    ('signed',   'long',  'int'),
+    ('long',     'long',  'int'),
+    ('long',     'double'),
+    ('unsigned', 'long',  'long'),
+    ('signed',   'long',  'long'),
+    ('unsigned', 'short'),
+    ('signed',   'short'),
+    ('unsigned', 'int'),
+    ('signed',   'int'),
+    ('long',     'long'),
+    ('short',    'int'),
+    ('long',     'int'),
+    ('signed',),
+    ('unsigned',),
+    ('short',),
+    ('long',),
+    ('void',),
+    ('bool',),
+    ('char',),
+    ('signed',   'char'),
+    ('unsigned', 'char'),
+    ('wchar_t',),
+    ('char8_t',),
+    ('char16_t',),
+    ('char32_t',),
+    ('int',),
+    ('float',),
+    ('double',),
+]
+
+def _try_match_builtin(ts):
+    max_len = 4
+    words = []
+    for i in range(max_len):
+        tok = ts.peek(i)
+        if tok and tok[0] == 'WORD':
+            words.append(tok[1])
+        else:
+            break
+    for L in range(min(len(words), max_len), 0, -1):
+        key = tuple(w.lower() for w in words[:L])
+        if key in _BUILTIN_COMBOS:
+            out_tokens = [ts.next()[1] for _ in range(L)]
+            return ' '.join(out_tokens)
+    return None
+
 def _tokens_to_spelling(tokens):
     parts = []
     prev_kind = None
@@ -612,16 +621,12 @@ def _tokens_to_spelling(tokens):
     for kind, val in tokens:
         need_space = False
         if parts:
-            # space between two WORDs / NUMBERs
             if (prev_kind in ('WORD', 'NUMBER') and kind in ('WORD', 'NUMBER')):
                 need_space = True
-            # space before * & && if previous wasn't a symbol starting a scope
             if kind == 'SYMBOL' and val in ('*', '&', '&&') and (prev_val not in ('::',)):
                 need_space = True
-            # space after > when next is WORD (templates)
             if prev_val == '>' and kind in ('WORD', 'NUMBER'):
                 need_space = True
-            # collapse spaces around ::, <, >
             if val in ('::', '>', '<'):
                 need_space = False
             if prev_val in ('::', '<', '>'):
@@ -633,13 +638,8 @@ def _tokens_to_spelling(tokens):
     return ''.join(parts)
 
 def parse_operator_function(ts):
-    """
-    Parse [scope::]* operator <operator-id or conversion-type-id> ( param-list )
-    Returns FunctionNode or None.
-    """
     save = ts.pos
 
-    # swallow optional scope qualifiers: A::B:: ...
     while True:
         t1 = ts.peek()
         t2 = ts.peek(1)
@@ -648,13 +648,11 @@ def parse_operator_function(ts):
         else:
             break
 
-    # operator keyword
     if not (ts.peek() and ts.peek()[0] == 'WORD' and ts.peek()[1] == 'operator'):
         ts.pos = save
         return None
-    ts.next()  # consume 'operator'
+    ts.next()
 
-    # Collect operator-id / conversion-type-id tokens up to the parameter '('
     name_tokens = []
     templ_depth = 0
     while True:
@@ -670,7 +668,6 @@ def parse_operator_function(ts):
             templ_depth -= 1
         name_tokens.append(ts.next())
 
-    # Now parameter list
     ts.expect('SYMBOL', '(')
     params = parse_tuple_args(ts)
     ts.expect('SYMBOL', ')')
@@ -679,18 +676,11 @@ def parse_operator_function(ts):
     return FunctionNode(return_type=None, func_name=func_name, func_template_args=[], parameters=params)
 
 def parse_declaration(ts):
-    '''
-    Parses a top-level declaration. If we only get a TypeNode, we return it
-    (bare type). If we see a name, we parse as a variable, function, or function call.
-    This revised version does not try to “optimize away” a parenthesized argument list,
-    so that the reconstructed code exactly matches the input.
-    '''
     opfn = parse_operator_function(ts)
     if opfn:
         ts.consume_if('SYMBOL', ';')
         return opfn
 
-    # First, parse a type with possible nesting.
     rtype = parse_type_with_nesting(ts)
     if not rtype:
         return None
@@ -700,17 +690,14 @@ def parse_declaration(ts):
         ts.consume_if('SYMBOL', ';')
         return rtype
 
-    # If the next token is a word, then treat it as an explicit variable or function name.
     if nxt[0] == 'WORD':
         name_ = nxt[1]
-        ts.next()  # consume the variable/function name
+        ts.next()
 
-        # Check for any function template arguments
         func_tmpl = []
         if ts.consume_if('SYMBOL', '<'):
             func_tmpl = parse_template_args(ts)
 
-        # If a '(' follows, this is a function declaration.
         if ts.consume_if('SYMBOL', '('):
             params = parse_tuple_args(ts)
             ts.expect('SYMBOL', ')')
@@ -720,13 +707,11 @@ def parse_declaration(ts):
             ts.consume_if('SYMBOL', ';')
             return VariableNode(rtype, name_)
 
-    # Otherwise, if a '(' follows the type, treat it as part of the type (a tuple of arguments)
-    # and preserve them exactly.
     if ts.consume_if('SYMBOL', '('):
         params = parse_tuple_args(ts)
         ts.expect('SYMBOL', ')')
         ts.consume_if('SYMBOL', ';')
-        rtype.tuple_args = params  # ALWAYS preserve the parsed tuple arguments
+        rtype.tuple_args = params
         return rtype
 
     ts.consume_if('SYMBOL', ';')
@@ -743,14 +728,24 @@ def parse_one_type(ts):
     start = ts.pos
     leading_mods = parse_modifiers(ts)
 
-    # Maybe 'typename X::template Y<...>::type'
     special_typename_node = parse_typename_dependent_expr(ts, leading_mods)
     if special_typename_node:
         trailing_mods = parse_modifiers(ts)
         special_typename_node.trailing_mods.extend(trailing_mods)
         return special_typename_node
 
-    # Gather possible namespaces + final word
+    builtin = _try_match_builtin(ts)
+    if builtin is not None:
+        trailing_mods = parse_modifiers(ts)
+        node = TypeNode(
+            namespaces=[],
+            typename=builtin,
+            template_args=[],
+            leading_mods=leading_mods,
+            trailing_mods=trailing_mods,
+        )
+        return node
+
     namespaces = []
     typename = None
     while True:
@@ -766,16 +761,13 @@ def parse_one_type(ts):
             break
 
     if not typename and not namespaces and not leading_mods:
-        # fallback
         ts.pos = start
         return None
 
-    # check if template <...>
     targs = []
     if typename and ts.consume_if('SYMBOL', '<'):
         targs = parse_template_args(ts)
 
-    # function pointer attempt?
     funcptr_node = parse_function_pointer(ts, namespaces, typename, targs, leading_mods)
     if funcptr_node:
         trailing_mods = parse_modifiers(ts)
@@ -794,19 +786,16 @@ def parse_one_type(ts):
 
 def parse_typename_dependent_expr(ts, already_collected_mods):
     '''
-    Parses expressions like 'typename A::template B<...>::type' or 'typename A::template B<...>::size'.
-    Returns a TypeNode if matched, else None.
+    Parses 'typename A::template B<...>::type' or '...::size'.
     '''
     start_pos = ts.pos
     has_typename = False
 
-    # Check if 'typename' is already in modifiers.
     if 'typename' in already_collected_mods:
         new_mods = [m for m in already_collected_mods if m != 'typename']
         already_collected_mods[:] = new_mods
         has_typename = True
     else:
-        # Or check next token.
         nxt = ts.peek()
         if nxt and nxt[0] == 'WORD' and nxt[1] == 'typename':
             ts.next()
@@ -828,7 +817,7 @@ def parse_typename_dependent_expr(ts, already_collected_mods):
             return None
         look = ts.peek()
         if look and look[0] == 'WORD' and look[1] == 'template':
-            ts.next()  # consume 'template'
+            ts.next()
             namespaces.append(nsname)
             break
         else:
@@ -854,7 +843,7 @@ def parse_typename_dependent_expr(ts, already_collected_mods):
         ts.pos = start_pos
         return None
     suffix = w3[1]
-    ts.next()  # consume the suffix token
+    ts.next()
 
     return TypeNode(
         namespaces=namespaces,
@@ -874,33 +863,26 @@ def parse_nested_chain(parent, ts):
         if not nxt or nxt[0] != 'WORD':
             break
 
-        # Check if 'nxt' is a modifier
         if nxt[1] in {'class', 'struct', 'enum'}:
-            # Consume the modifier
             mod = ts.next()[1]
-            # Now expect the type name
             type_nxt = ts.peek()
             if not type_nxt or type_nxt[0] != 'WORD':
                 raise ParserError(f'Expected type name after modifier \'{mod}\'')
             typename = ts.next()[1]
 
-            # Check for template args
             if ts.consume_if('SYMBOL', '<'):
                 targs = parse_template_args(ts)
             else:
                 targs = []
 
-            # Check for tuple args
             if ts.consume_if('SYMBOL', '('):
                 tuple_pars = parse_tuple_args(ts)
                 ts.expect('SYMBOL', ')')
             else:
                 tuple_pars = []
 
-            # Parse trailing modifiers
             mods = parse_modifiers(ts)
 
-            # Create TypeNode with leading_mods
             child = TypeNode(
                 leading_mods=[mod],
                 typename=typename,
@@ -911,7 +893,6 @@ def parse_nested_chain(parent, ts):
             parent.nested_types.append(child)
             parse_nested_chain(child, ts)
         else:
-            # It's a regular type name
             sub_name = ts.next()[1]
 
             if ts.consume_if('SYMBOL', '<'):
@@ -938,15 +919,12 @@ def parse_nested_chain(parent, ts):
                 parent.nested_types.append(child)
                 parse_nested_chain(child, ts)
 
-# Add a helper that checks (without consuming tokens) if the tokens ahead match a function pointer.
 def is_function_pointer(ts):
     pos = ts.pos
     if pos < len(ts.tokens) and ts.tokens[pos] == ('SYMBOL', '('):
         temp_pos = pos + 1
-        # Optionally skip a calling convention token if present.
-        if temp_pos < len(ts.tokens) and ts.tokens[temp_pos][0] == 'WORD' and ts.tokens[temp_pos][1] in {'__cdecl', '__stdcall', '__fastcall', '__vectorcall'}:
+        if temp_pos < len(ts.tokens) and ts.tokens[temp_pos][0] == 'WORD' and ts.tokens[temp_pos][1] in {'__cdecl', '__stdcall', '__fastcall', '__vectorcall', '__thiscall'}:
             temp_pos += 1
-        # Next token must be '*' for a function pointer.
         if temp_pos < len(ts.tokens) and ts.tokens[temp_pos] == ('SYMBOL', '*'):
             return True
     return False
@@ -957,14 +935,14 @@ def parse_function_pointer(ts, namespaces, base_typename, targs, leading_mods):
 
     ts.next()  # '('
     calling_convention = None
-    if ts.peek() and ts.peek()[0] == 'WORD' and ts.peek()[1] in {'__cdecl', '__stdcall', '__fastcall', '__vectorcall'}:
+    if ts.peek() and ts.peek()[0] == 'WORD' and ts.peek()[1] in {'__cdecl', '__stdcall', '__fastcall', '__vectorcall', '__thiscall'}:
         calling_convention = ts.next()[1]
     if not ts.consume_if('SYMBOL', '*'):
         return None
     if not ts.consume_if('SYMBOL', ')'):
-        raise ParserError("Expected ')' after function pointer '*'.")
+        raise ParserError('Expected \')\' after function pointer \'*\'.')
     if not ts.consume_if('SYMBOL', '('):
-        raise ParserError("Expected '(' to start function pointer parameter list.")
+        raise ParserError('Expected \'(\' to start function pointer parameter list.')
     parameters = parse_tuple_args(ts)
     ts.expect('SYMBOL', ')')
 
@@ -980,55 +958,37 @@ def parse_function_pointer(ts, namespaces, base_typename, targs, leading_mods):
     )
 
 def parse_template_args(ts):
-    '''
-    Reads template args between < and >, treating 'class', 'struct', 'enum' as modifiers.
-    Commas are required to separate arguments.
-    '''
     args = []
     while True:
-        # stop if we see '>'
         nxt = ts.peek()
         if not nxt:
             raise ParserError('Unclosed <... in template args')
         if nxt == ('SYMBOL', '>'):
-            ts.next()  # consume '>'
+            ts.next()
             break
 
-        # parse a single argument
         arg = parse_one_template_argument(ts)
         if not arg:
             raise ParserError('Failed to parse template argument')
         args.append(arg)
 
-        # If the next token is a comma, consume it and parse next arg
         ts.consume_if('SYMBOL', ',')
-
     return args
 
 def parse_one_template_argument(ts):
-    '''
-    Parse exactly one template argument, which can be:
-    - A type with possible leading modifiers
-    - A function pointer
-    - An ellipsis '...'
-    - A numeric literal
-    '''
     nxt = ts.peek()
     if not nxt:
         return None
 
-    # 1) Ellipsis
     if nxt[0] == 'ELLIPSIS':
         ts.next()
         return EllipsisNode()
 
-    # 2) Number
     if nxt[0] == 'NUMBER':
         val = int(nxt[1])
         ts.next()
         return ValueNode(val)
 
-    # 3) Type with possible leading modifiers
     type_node = parse_type_with_nesting(ts)
     if type_node:
         return type_node
@@ -1036,9 +996,6 @@ def parse_one_template_argument(ts):
     return None
 
 def parse_tuple_args(ts):
-    '''
-    Parses a list of arguments separated by commas within parentheses.
-    '''
     params = []
     first = True
     while True:
@@ -1053,7 +1010,6 @@ def parse_tuple_args(ts):
         save_pos = ts.pos
         ptype = parse_type_with_nesting(ts)
         if ptype:
-            # Possibly a param name
             nxt2 = ts.peek()
             if nxt2 and nxt2[0] == 'WORD':
                 pname = nxt2[1]
@@ -1078,10 +1034,6 @@ def parse_maybe_literal(ts):
     return None
 
 def parse_modifiers(ts):
-    '''
-    Grabs recognized type modifiers or calling conventions:
-      const, volatile, static, inline, __cdecl, __stdcall, &/&&/*, class, struct, enum
-    '''
     mods = []
     while True:
         nxt = ts.peek()
@@ -1092,7 +1044,7 @@ def parse_modifiers(ts):
             if w_ in (
                 'const', 'volatile', 'constexpr', 'static', 'inline', 'extern',
                 'register', 'mutable', 'thread_local', 'typename',
-                '__cdecl', '__stdcall', '__fastcall', '__vectorcall',
+                '__cdecl', '__stdcall', '__fastcall', '__vectorcall', '__thiscall',
                 'class', 'struct', 'enum'
             ):
                 mods.append(w_)
@@ -1159,7 +1111,6 @@ def extract_function_info(decl_str):
         return None
 
     for node in ast_nodes:
-        # Function type (e.g., "Ret NS::Cls::f(T1, T2)")
         if isinstance(node, FunctionNode):
             params = []
             for p in node.parameters:
@@ -1172,7 +1123,6 @@ def extract_function_info(decl_str):
             func_name = node.func_name or (node.return_type.typename if node.return_type else '')
             return (func_name, params)
 
-        # Type with tuple args (e.g., "void(int, float)")
         if isinstance(node, TypeNode):
             params = []
             for p in node.tuple_args:
@@ -1895,6 +1845,217 @@ class DeclarationConverter:
             self.declare.add(name)
         return name
 
+if DUMP_FOR_SOURCE_PYTHON:
+    def _tinfo_is_char_like(t):
+        try:
+            return t.is_char() or t.is_decl_char() or t.is_uchar() or t.is_decl_uchar()
+        except Exception:
+            return False
+
+    def _tinfo_pointee(t):
+        try:
+            if t and t.is_ptr():
+                return t.get_pointed_object()
+        except Exception:
+            pass
+        return None
+
+    def _tinfo_size(t):
+        try:
+            return t.get_size()
+        except Exception:
+            return 0
+
+    def _tinfo_is_signed(t):
+        try:
+            if t.is_signed(): return True
+            if t.is_unsigned(): return False
+            return False
+        except Exception:
+            return False
+
+    def tinfo_to_datatype_enum(t):
+        if not t or (not t.is_correct()) or (not t.is_well_defined()):
+            return 'DataType.POINTER'
+
+        if t.is_ptr():
+            pt = _tinfo_pointee(t)
+            if pt and _tinfo_is_char_like(pt):
+                return 'DataType.STRING'
+            return 'DataType.POINTER'
+
+        if t.is_void() or t.is_decl_void():
+            return 'DataType.VOID'
+
+        if t.is_bool() or t.is_decl_bool():
+            return 'DataType.BOOL'
+
+        if t.is_float() or t.is_decl_float():
+            return 'DataType.FLOAT'
+        if t.is_double() or t.is_decl_double():
+            return 'DataType.DOUBLE'
+
+        if t.is_integral() or t.is_arithmetic() or t.is_decl_arithmetic():
+            sz = _tinfo_size(t)
+            sign = _tinfo_is_signed(t)
+            if sz == 1:
+                return 'DataType.CHAR' if sign else 'DataType.UCHAR'
+            if sz == 2:
+                return 'DataType.SHORT' if sign else 'DataType.USHORT'
+            if sz == 4:
+                return 'DataType.INT' if sign else 'DataType.UINT'
+            if sz == 8:
+                return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
+            return 'DataType.POINTER'
+
+        return 'DataType.POINTER'
+
+    class PythonEmitter:
+        def __init__(self, conv):
+            self.conv = conv
+            self.used_func_names = {}
+
+        def _normalize_name(self, cls, offset, base_name, idx):
+            name = base_name.strip()
+            if name.startswith('operator'):
+                name = f'operator_{idx:010}'
+            name = re.sub(r'[^0-9A-Za-z_]', '_', name)
+            name = re.sub(r'__+', '_', name).strip('_')
+            if not name:
+                name = f'Method_{idx:010}'
+
+            key = (cls, offset, name)
+            self.used_func_names.setdefault(key, 0)
+            self.used_func_names[key] += 1
+            if self.used_func_names[key] > 1:
+                name = f'{name}_{self.used_func_names[key]}'
+            return name
+
+        def _extract_signature_datatypes(self, func_ea, demangled):
+            tinfo = None
+            ret_dt = 'DataType.VOID'
+            arg_dts = []
+            conv_str = 'Convention.THISCALL'
+
+            decomp = None
+            try:
+                decomp = ida_hexrays.decompile(func_ea)
+            except Exception:
+                decomp = None
+
+            if decomp:
+                tinfo = decomp.type
+            else:
+                f = ida_funcs.get_func(func_ea)
+                if f and f.prototype:
+                    tinfo = f.prototype
+
+            if tinfo and tinfo.is_func():
+                try:
+                    ret_dt = tinfo_to_datatype_enum(tinfo.get_rettype())
+                except Exception:
+                    ret_dt = 'DataType.VOID'
+
+                try:
+                    nargs = tinfo.get_nargs()
+                except Exception:
+                    nargs = 0
+
+                for i in range(1, nargs):
+                    try:
+                        a_t = tinfo.get_nth_arg(i)
+                        a_t.clr_decl_const_volatile()
+                        arg_dts.append(tinfo_to_datatype_enum(a_t))
+                    except Exception:
+                        arg_dts.append('DataType.POINTER')
+
+                return ret_dt, arg_dts, 'Convention.THISCALL'
+
+            fi = extract_function_info(demangled)
+            if fi:
+                _, dargs = fi
+                arg_dts = []
+                for a in dargs:
+                    tif = self.conv.parse_type(a)
+                    if tif and is_builtin_type(tif):
+                        arg_dts.append(tinfo_to_datatype_enum(tif))
+                    else:
+                        if isinstance(a, str) and ('char*' in a or 'const char*' in a):
+                            arg_dts.append('DataType.STRING')
+                        else:
+                            arg_dts.append('DataType.POINTER')
+            return ret_dt, arg_dts, conv_str
+
+        def _is_pure_or_destructor(self, demangled):
+            d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
+            if d.startswith('~') or '::~' in d or 'destructor' in d:
+                return 'destructor'
+            if d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
+                return 'pure'
+            return None
+
+        def generate(self, class_vfuncs):
+            lines = []
+
+            lines.append('from memory import DataType, Convention, CustomType')
+            lines.append('from memory import manager')
+            lines.append('')
+            lines.append('')
+
+            queue = collections.deque([cls for cls, deg in self.conv.in_degree.items() if deg == 0])
+            sorted_classes = []
+            while queue:
+                cls = queue.popleft()
+                sorted_classes.append(cls)
+                for derived in self.conv.reverse_graph.get(cls, []):
+                    self.conv.in_degree[derived] -= 1
+                    if self.conv.in_degree[derived] == 0:
+                        queue.append(derived)
+
+            for cls in sorted_classes:
+                if cls not in class_vfuncs:
+                    continue
+
+                for offset, vfuncs in class_vfuncs[cls].items():
+                    py_cls_name = f'{cls}_{offset:08X}'
+                    lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
+                    lines.append(f'    \'\'\'OFFSET: 0x{offset:08X} | Source: {cls}\'\'\'')
+
+                    other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
+                    filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
+
+                    if not filtered:
+                        lines.append('    pass')
+                        lines.append('')
+                        continue
+
+                    for logical_idx, phys_idx, func_ea, demangled in filtered:
+                        if not demangled:
+                            continue
+                        base = demangled.split('(')[0].split('::')[-1]
+                        method_name = self._normalize_name(cls, offset, base, logical_idx)
+
+                        special = self._is_pure_or_destructor(demangled)
+                        if special == 'destructor':
+                            lines.append(
+                                f'    {method_name} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                            )
+                            continue
+                        if special == 'pure':
+                            lines.append(
+                                f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                            )
+                            continue
+
+                        ret_dt, arg_dts, conv_str = self._extract_signature_datatypes(func_ea, demangled)
+                        args_repr = ', '.join(arg_dts)
+                        lines.append(
+                            f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, {conv_str})'
+                        )
+
+                    lines.append('')
+            return '\n'.join(lines)
+
 def get_vtable_functions(vtable):
 
     funcs = []
@@ -2512,13 +2673,28 @@ class vdump_t(ida_idaapi.plugin_t):
             print_message('ERROR: Unsupported file type')
             return
 
-        converter = DeclarationConverter()
-        output = converter.convert(trees, class_vfuncs)
         idb_path = Path(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
-        output_path = idb_path.with_suffix('.h')
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(output)
-        print_message(f'NOTE: VTable declarations written to {output_path}')
+
+        q = idb_path
+        while q.suffix:
+            q = q.with_suffix('')
+
+        idb_path = q
+       
+        converter = DeclarationConverter()
+        output_h = converter.convert(trees, class_vfuncs)
+        output_h_path = idb_path.with_suffix('.h')
+        with open(output_h_path, 'w', encoding='utf-8') as f:
+            f.write(output_h)
+        print_message(f'NOTE: C++ VTable declarations written to {output_h_path}')
+
+        if DUMP_FOR_SOURCE_PYTHON:
+            py_emitter = PythonEmitter(converter)
+            output_py = py_emitter.generate(class_vfuncs)
+            output_py_path = idb_path.with_suffix('.py')
+            with open(output_py_path, 'w', encoding='utf-8') as f:
+                f.write(output_py)
+            print_message(f'NOTE: Python DSL dumped to {output_py_path}')
 
     @staticmethod
     def main():
