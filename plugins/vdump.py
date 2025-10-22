@@ -51,7 +51,7 @@ import ida_typeinf
 import ida_loader
 
 VDUMP_VERSION = '3.0.0'
-DUMP_FOR_SOURCE_PYTHON = True
+DUMP_FOR_SOURCE_PYTHON = False
 
 ################################################################################
 # Base functions
