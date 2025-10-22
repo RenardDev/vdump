@@ -1875,21 +1875,35 @@ if DUMP_FOR_SOURCE_PYTHON:
             return False
 
     def tinfo_to_datatype_enum(t):
+        try:
+            if getattr(t, "is_ref", None) and t.is_ref():
+                try:
+                    base = ida_typeinf.tinfo_t(t)
+                    base.remove_ref()
+                    return tinfo_to_datatype_enum(base)
+                except Exception:
+                    return 'DataType.POINTER'
+            if getattr(t, "is_array", None) and t.is_array():
+                return 'DataType.POINTER'
+        except Exception:
+            pass
+
         if not t or (not t.is_correct()) or (not t.is_well_defined()):
             return 'DataType.POINTER'
 
-        if t.is_ptr():
-            pt = _tinfo_pointee(t)
-            if pt and _tinfo_is_char_like(pt):
-                return 'DataType.STRING'
-            return 'DataType.POINTER'
+        try:
+            if t.is_ptr():
+                pt = _tinfo_pointee(t)
+                if pt and _tinfo_is_char_like(pt):
+                    return 'DataType.STRING'
+                return 'DataType.POINTER'
+        except Exception:
+            pass
 
         if t.is_void() or t.is_decl_void():
             return 'DataType.VOID'
-
         if t.is_bool() or t.is_decl_bool():
             return 'DataType.BOOL'
-
         if t.is_float() or t.is_decl_float():
             return 'DataType.FLOAT'
         if t.is_double() or t.is_decl_double():
@@ -1941,23 +1955,32 @@ if DUMP_FOR_SOURCE_PYTHON:
             return name
 
         def _extract_signature_datatypes(self, func_ea, demangled):
-            tinfo = None
             ret_dt = 'DataType.VOID'
             arg_dts = []
             conv_str = 'Convention.THISCALL'
 
-            decomp = None
+            tinfo = None
             try:
                 decomp = ida_hexrays.decompile(func_ea)
             except Exception:
                 decomp = None
-
             if decomp:
                 tinfo = decomp.type
             else:
                 f = ida_funcs.get_func(func_ea)
                 if f and f.prototype:
                     tinfo = f.prototype
+
+            def _dt_from_demangled_arg(a: str) -> str:
+                a_l = a.replace('const', '').replace('volatile', '').strip()
+                if '*' in a_l or '&' in a_l:
+                    if 'char*' in a_l or 'const char*' in a_l:
+                        return 'DataType.STRING'
+                    return 'DataType.POINTER'
+                tif = self.conv.parse_type(a)
+                if tif and is_builtin_type(tif):
+                    return tinfo_to_datatype_enum(tif)
+                return 'DataType.POINTER'
 
             if tinfo and tinfo.is_func():
                 try:
@@ -1978,22 +2001,25 @@ if DUMP_FOR_SOURCE_PYTHON:
                     except Exception:
                         arg_dts.append('DataType.POINTER')
 
-                return ret_dt, arg_dts, 'Convention.THISCALL'
+                fi = extract_function_info(demangled)
+                if fi:
+                    _, dargs = fi
+                    for i, a in enumerate(dargs):
+                        override_dt = _dt_from_demangled_arg(a)
+                        if i >= len(arg_dts):
+                            arg_dts.append(override_dt)
+                        else:
+                            if override_dt in ('DataType.POINTER', 'DataType.STRING'):
+                                arg_dts[i] = override_dt
+
+                return ret_dt, arg_dts, conv_str
 
             fi = extract_function_info(demangled)
             if fi:
                 _, dargs = fi
-                arg_dts = []
-                for a in dargs:
-                    tif = self.conv.parse_type(a)
-                    if tif and is_builtin_type(tif):
-                        arg_dts.append(tinfo_to_datatype_enum(tif))
-                    else:
-                        if isinstance(a, str) and ('char*' in a or 'const char*' in a):
-                            arg_dts.append('DataType.STRING')
-                        else:
-                            arg_dts.append('DataType.POINTER')
+                arg_dts = [_dt_from_demangled_arg(a) for a in dargs]
             return ret_dt, arg_dts, conv_str
+
 
         def _is_pure_or_destructor(self, demangled):
             d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
