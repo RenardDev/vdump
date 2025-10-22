@@ -1161,26 +1161,7 @@ def format_name(name):
     name = name.removesuffix('_')
     return name
 
-def normalize_tinfo(t):
-    if not t.is_correct() or not t.is_well_defined():
-        return 'void*'
-
-    if any((
-        t.is_ptr(), t.is_array(), t.is_func(), t.is_funcptr(), t.is_sue(),
-        t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(), t.is_complex(),
-        t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(), t.is_forward_decl(),
-        t.is_forward_enum(), t.is_forward_struct(), t.is_forward_union(), t.is_varstruct(),
-        t.is_varmember(), t.is_vftable(), t.is_sse_type(), t.is_tbyte(), t.is_unknown(),
-        t.is_decl_array(), t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
-        t.is_decl_func(), t.is_decl_ptr(), t.is_decl_struct(), t.is_decl_sue(),
-        t.is_decl_typedef(), t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(),
-        t.is_decl_partial(), t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
-        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
-        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
-        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
-    )):
-        return 'void*'
-
+def _scalar_name(t):
     if t.is_void() or t.is_decl_void():
         return 'void'
     if t.is_bool() or t.is_decl_bool():
@@ -1205,14 +1186,7 @@ def normalize_tinfo(t):
             if t.is_int128() or t.is_decl_int128(): return 'void*'
             if t.is_int() or t.is_decl_int():
                 return 'int' if size != 1 else 'char'
-            
-            return {
-                1: 'char',
-                2: 'short',
-                4: 'int',
-                8: 'long long',
-                16: 'void*'
-            }.get(size, 'int')
+            return {1:'char',2:'short',4:'int',8:'long long',16:'void*'}.get(size,'int')
         else:
             if t.is_uint16() or t.is_decl_uint16(): return 'unsigned short'
             if t.is_uint32() or t.is_decl_uint32(): return 'unsigned int'
@@ -1220,24 +1194,69 @@ def normalize_tinfo(t):
             if t.is_uint128() or t.is_decl_uint128(): return 'void*'
             if t.is_uint() or t.is_decl_uint():
                 return 'unsigned int' if size != 1 else 'unsigned char'
-            
-            return {
-                1: 'unsigned char',
-                2: 'unsigned short',
-                4: 'unsigned int',
-                8: 'unsigned long long',
-                16: 'void*'
-            }.get(size, 'unsigned int')
-    
+            return {1:'unsigned char',2:'unsigned short',4:'unsigned int',8:'unsigned long long',16:'void*'}.get(size,'unsigned int')
+
     if t.is_floating() or t.is_decl_floating():
-        return {
-            4: 'float',
-            8: 'double',
-            10: 'long double',
-            16: 'long double'
-        }.get(size, 'double')
+        return {4:'float',8:'double',10:'long double',16:'long double'}.get(size,'double')
 
     return 'void*'
+
+def normalize_tinfo(t):
+    if not t.is_correct() or not t.is_well_defined():
+        return 'void*'
+
+    if t.is_func() or t.is_funcptr():
+        return 'void*'
+
+    if t.is_ptr():
+        pt = ida_typeinf.remove_pointer(t)
+        if is_builtin_type(pt):
+            qualifiers = []
+            try:
+                if pt.is_const(): qualifiers.append('const')
+                if pt.is_volatile(): qualifiers.append('volatile')
+            except Exception:
+                pass
+
+            base = _scalar_name(pt)
+            if qualifiers:
+                base = ' '.join(qualifiers + [base])
+            return base + '*'
+
+        return 'void*'
+
+    if t.is_array():
+        try:
+            et = ida_typeinf.tinfo_t()
+            if t.get_array_element(et) and is_builtin_type(et):
+                qualifiers = []
+                if et.is_const(): qualifiers.append('const')
+                if et.is_volatile(): qualifiers.append('volatile')
+                base = _scalar_name(et)
+                if qualifiers:
+                    base = ' '.join(qualifiers + [base])
+                return base + '*'
+        except Exception:
+            pass
+        return 'void*'
+
+    if any((
+        t.is_sue(), t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(),
+        t.is_complex(), t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(),
+        t.is_forward_decl(), t.is_forward_enum(), t.is_forward_struct(),
+        t.is_forward_union(), t.is_varstruct(), t.is_varmember(), t.is_vftable(),
+        t.is_sse_type(), t.is_tbyte(), t.is_unknown(), t.is_decl_array(),
+        t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
+        t.is_decl_func(), t.is_decl_struct(), t.is_decl_sue(), t.is_decl_typedef(),
+        t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(), t.is_decl_partial(),
+        t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
+        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
+        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
+        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
+    )):
+        return 'void*'
+
+    return _scalar_name(t)
 
 def is_builtin_type(t):
     if t.is_ptr():
@@ -1525,6 +1544,32 @@ class DeclarationConverter:
             return f'operator_{idx:010}'
         return name
 
+    def canonicalize_arg_from_demangled(self, s):
+        s = re.sub(r'\bvolatile\b', '', s).strip() 
+        tif = self.parse_type(s)
+        if tif:
+            if tif.is_func():
+                return 'void*'
+            if tif.is_funcptr():
+                return 'void*'
+
+            if tif.is_ptr():
+                pt = ida_typeinf.remove_pointer(tif)
+                if pt:
+                    pt.clr_decl_const_volatile()
+                    if is_builtin_type(pt):
+                        out = re.sub(r'\s+', ' ', s)
+                        out = out.replace(' *', '*').replace(' &', '&')
+                        return out
+                return 'void*'
+
+            if is_builtin_type(tif):
+                return re.sub(r'\s+', ' ', s)
+
+            return 'void*'
+
+        return 'void*'
+
     def process_function(self, idx, func, demangled, cls, offset):
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
@@ -1568,17 +1613,20 @@ class DeclarationConverter:
 
         func_info = extract_function_info(demangled)
         if func_info:
-            demangled_args = []
             func_name, dargs = func_info
             func_name = self._normalize_operator_name(func_name, idx)
-            for i, a in enumerate(dargs):
-                tif = self.parse_type(a)
-                arg_str = 'void*'
-                if tif and is_builtin_type(tif):
-                    arg_str = dargs[i]
-                demangled_args.append(arg_str)
-            args = demangled_args
+            args = [ self.canonicalize_arg_from_demangled(a) for a in dargs ]
         else:
+            decompiled_args = []
+            if type:
+                for i in range(1, type.get_nargs()):
+                    arg = type.get_nth_arg(i)
+                    arg.clr_decl_const_volatile()
+                    arg_str = self.simplify_type(arg)
+                    if arg_str == 'void' and i <= 2:
+                        arg_str = 'void*'
+                    decompiled_args.append(arg_str)
+            args = decompiled_args
             func_name = demangled.split('(')[0].split('::')[-1]
             func_name = self._normalize_operator_name(func_name, idx)
 
@@ -1654,21 +1702,25 @@ class DeclarationConverter:
 
         func_info = extract_function_info(demangled)
         if func_info:
-            demangled_args = []
             func_name, dargs = func_info
             func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'static_' + func_name
-            for i, a in enumerate(dargs):
-                tif = self.parse_type(a)
-                arg_str = 'void*'
-                if tif and is_builtin_type(tif):
-                    arg_str = dargs[i]
-                demangled_args.append(arg_str)
-            args = demangled_args
+            args = [ self.canonicalize_arg_from_demangled(a) for a in dargs ]
         else:
+            decompiled_args = []
+            if type:
+                for i in range(1, type.get_nargs()):
+                    arg = type.get_nth_arg(i)
+                    arg.clr_decl_const_volatile()
+                    arg_str = self.simplify_type(arg)
+                    if arg_str == 'void' and i <= 2:
+                        arg_str = 'void*'
+                    decompiled_args.append(arg_str)
+            args = decompiled_args
             func_name = demangled.split('(')[0].split('::')[-1]
             func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'static_' + func_name
+
 
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
             if args:
@@ -1876,14 +1928,14 @@ if DUMP_FOR_SOURCE_PYTHON:
 
     def tinfo_to_datatype_enum(t):
         try:
-            if getattr(t, "is_ref", None) and t.is_ref():
+            if t.is_ref():
                 try:
                     base = ida_typeinf.tinfo_t(t)
                     base.remove_ref()
                     return tinfo_to_datatype_enum(base)
                 except Exception:
                     return 'DataType.POINTER'
-            if getattr(t, "is_array", None) and t.is_array():
+            if t.is_array():
                 return 'DataType.POINTER'
         except Exception:
             pass
@@ -1971,23 +2023,42 @@ if DUMP_FOR_SOURCE_PYTHON:
                 if f and f.prototype:
                     tinfo = f.prototype
 
-            def _dt_from_demangled_arg(a: str) -> str:
-                a_l = a.replace('const', '').replace('volatile', '').strip()
-                if '*' in a_l or '&' in a_l:
-                    if 'char*' in a_l or 'const char*' in a_l:
-                        return 'DataType.STRING'
-                    return 'DataType.POINTER'
-                tif = self.conv.parse_type(a)
-                if tif and is_builtin_type(tif):
-                    return tinfo_to_datatype_enum(tif)
-                return 'DataType.POINTER'
-
             if tinfo and tinfo.is_func():
                 try:
                     ret_dt = tinfo_to_datatype_enum(tinfo.get_rettype())
                 except Exception:
                     ret_dt = 'DataType.VOID'
 
+            fi = extract_function_info(demangled)
+            if fi:
+                _, dargs = fi
+
+                def _dt_from_demangled_arg_strict(a: str) -> str:
+                    tif = self.conv.parse_type(a)
+                    if tif:
+                        try:
+                            if tif.is_func():
+                                return 'DataType.POINTER'
+                            if tif.is_funcptr():
+                                return 'DataType.POINTER'
+
+                            if tif.is_ptr():
+                                pt = ida_typeinf.remove_pointer(tif)
+                                if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
+                                    return 'DataType.STRING'
+                                return 'DataType.POINTER'
+
+                            if is_builtin_type(tif):
+                                return tinfo_to_datatype_enum(tif)
+                        except Exception:
+                            pass
+
+                    return 'DataType.POINTER'
+
+                arg_dts = [_dt_from_demangled_arg_strict(a) for a in dargs]
+                return ret_dt, arg_dts, conv_str
+
+            if tinfo and tinfo.is_func():
                 try:
                     nargs = tinfo.get_nargs()
                 except Exception:
@@ -2001,25 +2072,9 @@ if DUMP_FOR_SOURCE_PYTHON:
                     except Exception:
                         arg_dts.append('DataType.POINTER')
 
-                fi = extract_function_info(demangled)
-                if fi:
-                    _, dargs = fi
-                    for i, a in enumerate(dargs):
-                        override_dt = _dt_from_demangled_arg(a)
-                        if i >= len(arg_dts):
-                            arg_dts.append(override_dt)
-                        else:
-                            if override_dt in ('DataType.POINTER', 'DataType.STRING'):
-                                arg_dts[i] = override_dt
-
                 return ret_dt, arg_dts, conv_str
 
-            fi = extract_function_info(demangled)
-            if fi:
-                _, dargs = fi
-                arg_dts = [_dt_from_demangled_arg(a) for a in dargs]
             return ret_dt, arg_dts, conv_str
-
 
         def _is_pure_or_destructor(self, demangled):
             d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
@@ -2158,8 +2213,6 @@ def find_type_infos():
             ida_name.get_name_ea(ida_idaapi.BADADDR, '__ZTVN10__cxxabiv120__si_class_type_infoE'), # One parent
             ida_name.get_name_ea(ida_idaapi.BADADDR, '__ZTVN10__cxxabiv121__vmi_class_type_infoE') # Multiple parents
         )
-
-        # Iterate all types
 
         for type_address in type_addresses:
             if not is_valid_address(type_address):
