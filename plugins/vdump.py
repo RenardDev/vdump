@@ -1178,7 +1178,7 @@ def _scalar_name(t):
         return 'long double'
 
     size = t.get_size()
-    if t.is_integral() or t.is_arithmetic() or t.is_decl_arithmetic():
+    if t.is_integral() or t.is_arithmetic():
         if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
             if t.is_int16() or t.is_decl_int16(): return 'short'
             if t.is_int32() or t.is_decl_int32(): return 'int'
@@ -1297,7 +1297,7 @@ def is_builtin_type(t):
     if t.is_ldouble():
         return True
 
-    if t.is_integral() or t.is_arithmetic() or t.is_decl_arithmetic():
+    if t.is_integral() or t.is_arithmetic():
         if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
             if t.is_int16() or t.is_decl_int16(): return True
             if t.is_int32() or t.is_decl_int32(): return True
@@ -1961,7 +1961,7 @@ if DUMP_FOR_SOURCE_PYTHON:
         if t.is_double() or t.is_decl_double():
             return 'DataType.DOUBLE'
 
-        if t.is_integral() or t.is_arithmetic() or t.is_decl_arithmetic():
+        if t.is_integral() or t.is_arithmetic():
             sz = _tinfo_size(t)
             sign = _tinfo_is_signed(t)
             if sz == 1:
