@@ -2019,7 +2019,6 @@ if DUMP_FOR_SOURCE_PYTHON:
                 for offset, vfuncs in class_vfuncs[cls].items():
                     py_cls_name = f'{cls}_{offset:08X}'
                     lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
-                    lines.append(f'    \'\'\'OFFSET: 0x{offset:08X} | Source: {cls}\'\'\'')
 
                     other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
                     filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
