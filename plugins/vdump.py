@@ -1997,8 +1997,8 @@ if DUMP_FOR_SOURCE_PYTHON:
         def generate(self, class_vfuncs):
             lines = []
 
-            lines.append('from memory import DataType, Convention, CustomType')
-            lines.append('from memory import manager')
+            lines.append('from memory import DataType, Convention')
+            lines.append('from memory import manager, CustomType')
             lines.append('')
             lines.append('')
 
