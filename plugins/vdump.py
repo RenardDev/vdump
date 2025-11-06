@@ -1506,7 +1506,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_function(log_i, func, d2, cls, offset)
+                    decl = self.process_function(log_i, func, d2, cls, offset, offset_name)
                     decl_lines.append(f'    // {log_i:>10} - {d2}')
                     decl_lines.append(f'    {decl}\n')
 
@@ -1514,7 +1514,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset)
+                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset, offset_name)
                     decl_lines.append(f'    {decl}')
 
                 decl_lines.append('')
@@ -1523,7 +1523,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset)
+                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset, offset_name)
                     decl_lines.append(f'    {decl}')
 
                 decl_lines.append('};')
@@ -1542,7 +1542,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_function(log_i, func, d2, cls, offset)
+                    decl = self.process_function(log_i, func, d2, cls, offset, offset_name_full)
                     decl_lines_full.append(f'    // {log_i:>10} - {d2}')
                     decl_lines_full.append(f'    {decl}\n')
 
@@ -1550,7 +1550,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset)
+                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset, offset_name_full)
                     decl_lines_full.append(f'    {decl}')
 
                 decl_lines_full.append('')
@@ -1559,7 +1559,7 @@ class DeclarationConverter:
                     if not demangled:
                         continue
                     d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset)
+                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset, offset_name_full)
                     decl_lines_full.append(f'    {decl}')
 
                 decl_lines_full.append('};')
@@ -1606,13 +1606,14 @@ class DeclarationConverter:
 
         return 'void*'
 
-    def process_function(self, idx, func, demangled, cls, offset):
+    def process_function(self, idx, func, demangled, cls, offset, dtor_class_name=None):
+        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
             return f'virtual void PureStub_{idx:010}() = 0;'
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'virtual ~{cls}_{offset:08X}() = 0;'
+            return f'virtual ~{name_for_dtor}() = 0;'
 
         if '?' in demangled or '@' in demangled or '$' in demangled:
             return f'virtual void InvalidStub_{idx:010}() = 0;'
@@ -1679,7 +1680,8 @@ class DeclarationConverter:
 
         return f'virtual {ret_str} {final_name}({", ".join(args)}) = 0;'
 
-    def process_static_function(self, idx_logical, idx_callslot, func, demangled, cls, offset):
+    def process_static_function(self, idx_logical, idx_callslot, func, demangled, cls, offset, dtor_class_name=None):
+        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
             return (
@@ -1690,7 +1692,7 @@ class DeclarationConverter:
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
             return (
-                f'static void static_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ '
+                f'static void static_destructor_{name_for_dtor}(void* pThis, int nFixOffset) {{ '
                 f'void** pVTable = *reinterpret_cast<void***>(pThis); '
                 f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
             )
@@ -1757,7 +1759,6 @@ class DeclarationConverter:
             func_name = self._normalize_operator_name(func_name, idx_logical)
             func_name = 'static_' + func_name
 
-
         if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
             if args:
                 nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
@@ -1814,7 +1815,8 @@ class DeclarationConverter:
                 f'(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
             )
 
-    def process_get_function(self, idx_logical, idx_callslot, func, demangled, cls, offset):
+    def process_get_function(self, idx_logical, idx_callslot, func, demangled, cls, offset, dtor_class_name=None):
+        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
 
         if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
             return (
@@ -1825,7 +1827,7 @@ class DeclarationConverter:
 
         if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
             return (
-                f'static void* get_destructor_{cls}_{offset:08X}(void* pThis, int nFixOffset) {{ '
+                f'static void* get_destructor_{name_for_dtor}(void* pThis, int nFixOffset) {{ '
                 f'void** pVTable = *reinterpret_cast<void***>(pThis); '
                 f'return pVTable[{idx_callslot} + nFixOffset]; }};'
             )
