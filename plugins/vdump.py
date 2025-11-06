@@ -16,6 +16,7 @@ import collections
 import copy
 import struct
 import re
+from functools import lru_cache
 
 from pathlib import Path
 from datetime import datetime
@@ -50,7 +51,7 @@ import ida_idc
 import ida_typeinf
 import ida_loader
 
-VDUMP_VERSION = '3.0.0'
+VDUMP_VERSION = '4.0.0'
 DUMP_FOR_SOURCE_PYTHON = False
 
 ################################################################################
@@ -85,6 +86,207 @@ def find_pattern(pattern, min_address = None, max_address = None):
     address, _ = ida_bytes.bin_search(min_address, max_address, patterns, ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOBREAK | ida_bytes.BIN_SEARCH_NOSHOW)
     return address if is_valid_address(address) else 0
 
+
+################################################################################
+# Small helpers & caches (performance critical)
+################################################################################
+
+_FILETYPE = None
+_IS64 = None
+_IMGBASE = None
+
+# fast demangle cleanup
+_NONVT = '`non-virtual thunk to\''
+def _sanitize_demangled(d: str) -> str:
+    if not d:
+        return d
+    if _NONVT in d:
+        d = d.replace(_NONVT, '')
+    return d.strip()
+
+# compact formatter with translation table
+_re_backticks = re.compile(r'`[^`\']*\'')
+_trans = str.maketrans({
+    '(':'_', ')':'_', '<':'_', '>':'_', ',':'_', '&':'_', '?':'_', '@':'_', '[':'_', ']':'_',
+})
+_ws_multi = re.compile(r'\s+')
+_us_multi = re.compile(r'_+')
+
+def format_name(name: str) -> str:
+    if not name:
+        return name
+    name = name.replace('const','').replace('volatile','')
+    name = _re_backticks.sub('', name)
+    name = name.replace('::','_').translate(_trans)
+    name = _ws_multi.sub('_', name)
+    name = re.sub(r'\(.*\*\)\(.*\)', '', name)  # strip FP pattern
+    name = name.replace('*','')
+    name = _us_multi.sub('_', name)
+    if name.startswith('__'): name = name[2:]
+    if name.startswith('_'):  name = name[1:]
+    if name.endswith('__'):   name = name[:-2]
+    if name.endswith('_'):    name = name[:-1]
+    return name
+
+# parse_decl cache (expensive)
+@lru_cache(maxsize=8192)
+def _parse_type_cached(s: str):
+    tif = ida_typeinf.tinfo_t()
+    if ida_typeinf.parse_decl(tif, None, s, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
+        return None
+    # keep outer-most pointer if there are several, for stability with .is_ptr() checks
+    if tif.is_ptr():
+        t = tif
+        lt = tif
+        while t and t.is_ptr():
+            lt = t
+            t = t.get_pointed_object()
+        tif = lt
+    return tif
+
+def _scalar_name(t: ida_typeinf.tinfo_t) -> str:
+    if t.is_void() or t.is_decl_void():
+        return 'void'
+    if t.is_bool() or t.is_decl_bool():
+        return 'bool'
+    if t.is_char() or t.is_decl_char():
+        return 'char' if t.is_signed() else 'unsigned char'
+    if t.is_uchar() or t.is_decl_uchar():
+        return 'unsigned char'
+    if t.is_float() or t.is_decl_float():
+        return 'float'
+    if t.is_double() or t.is_decl_double():
+        return 'double'
+    if t.is_ldouble():
+        return 'long double'
+
+    size = t.get_size()
+    if t.is_integral() or t.is_arithmetic():
+        if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
+            if t.is_int16() or t.is_decl_int16(): return 'short'
+            if t.is_int32() or t.is_decl_int32(): return 'int'
+            if t.is_int64() or t.is_decl_int64(): return 'long long'
+            if t.is_int128() or t.is_decl_int128(): return 'void*'
+            if t.is_int() or t.is_decl_int(): return 'int' if size != 1 else 'char'
+            return {1:'char',2:'short',4:'int',8:'long long',16:'void*'}.get(size,'int')
+        else:
+            if t.is_uint16() or t.is_decl_uint16(): return 'unsigned short'
+            if t.is_uint32() or t.is_decl_uint32(): return 'unsigned int'
+            if t.is_uint64() or t.is_decl_uint64(): return 'unsigned long long'
+            if t.is_uint128() or t.is_decl_uint128(): return 'void*'
+            if t.is_uint() or t.is_decl_uint(): return 'unsigned int' if size != 1 else 'unsigned char'
+            return {1:'unsigned char',2:'unsigned short',4:'unsigned int',8:'unsigned long long',16:'void*'}.get(size,'unsigned int')
+
+    if t.is_floating() or t.is_decl_floating():
+        return {4:'float',8:'double',10:'long double',16:'long double'}.get(size,'double')
+
+    return 'void*'
+
+def is_builtin_type(t: ida_typeinf.tinfo_t) -> bool:
+    if t.is_ptr():
+        t = ida_typeinf.remove_pointer(t)
+        t.clr_decl_const_volatile()
+
+    if (not t.is_correct()) or (not t.is_well_defined()):
+        return False
+
+    if any((
+        t.is_ptr(), t.is_array(), t.is_func(), t.is_funcptr(), t.is_sue(),
+        t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(), t.is_complex(),
+        t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(), t.is_forward_decl(),
+        t.is_forward_enum(), t.is_forward_struct(), t.is_forward_union(), t.is_varstruct(),
+        t.is_varmember(), t.is_vftable(), t.is_sse_type(), t.is_tbyte(), t.is_unknown(),
+        t.is_decl_array(), t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
+        t.is_decl_func(), t.is_decl_ptr(), t.is_decl_struct(), t.is_decl_sue(),
+        t.is_decl_typedef(), t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(),
+        t.is_decl_partial(), t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
+        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
+        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
+        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
+    )):
+        return False
+
+    if t.is_void() or t.is_decl_void(): return True
+    if t.is_bool() or t.is_decl_bool(): return True
+    if t.is_char() or t.is_decl_char(): return True
+    if t.is_uchar() or t.is_decl_uchar(): return True
+    if t.is_float() or t.is_decl_float(): return True
+    if t.is_double() or t.is_decl_double(): return True
+    if t.is_ldouble(): return True
+
+    if t.is_integral() or t.is_arithmetic():
+        if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
+            if t.is_int16() or t.is_decl_int16(): return True
+            if t.is_int32() or t.is_decl_int32(): return True
+            if t.is_int64() or t.is_decl_int64(): return True
+            if t.is_int128() or t.is_decl_int128(): return True
+            if t.is_int() or t.is_decl_int(): return True
+            return False
+        else:
+            if t.is_uint16() or t.is_decl_uint16(): return True
+            if t.is_uint32() or t.is_decl_uint32(): return True
+            if t.is_uint64() or t.is_decl_uint64(): return True
+            if t.is_uint128() or t.is_decl_uint128(): return True
+            if t.is_uint() or t.is_decl_uint(): return True
+            return False
+
+    if t.is_floating() or t.is_decl_floating(): return True
+    return False
+
+def normalize_tinfo(t: ida_typeinf.tinfo_t) -> str:
+    if not t.is_correct() or not t.is_well_defined():
+        return 'void*'
+
+    if t.is_func() or t.is_funcptr():
+        return 'void*'
+
+    if t.is_ptr():
+        pt = ida_typeinf.remove_pointer(t)
+        if is_builtin_type(pt):
+            qualifiers = []
+            try:
+                if pt.is_const(): qualifiers.append('const')
+                if pt.is_volatile(): qualifiers.append('volatile')
+            except Exception:
+                pass
+            base = _scalar_name(pt)
+            if qualifiers:
+                base = ' '.join(qualifiers + [base])
+            return base + '*'
+        return 'void*'
+
+    if t.is_array():
+        try:
+            et = ida_typeinf.tinfo_t()
+            if t.get_array_element(et) and is_builtin_type(et):
+                qualifiers = []
+                if et.is_const(): qualifiers.append('const')
+                if et.is_volatile(): qualifiers.append('volatile')
+                base = _scalar_name(et)
+                if qualifiers:
+                    base = ' '.join(qualifiers + [base])
+                return base + '*'
+        except Exception:
+            pass
+        return 'void*'
+
+    if any((
+        t.is_sue(), t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(),
+        t.is_complex(), t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(),
+        t.is_forward_decl(), t.is_forward_enum(), t.is_forward_struct(),
+        t.is_forward_union(), t.is_varstruct(), t.is_varmember(), t.is_vftable(),
+        t.is_sse_type(), t.is_tbyte(), t.is_unknown(), t.is_decl_array(),
+        t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
+        t.is_decl_func(), t.is_decl_struct(), t.is_decl_sue(), t.is_decl_typedef(),
+        t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(), t.is_decl_partial(),
+        t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
+        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
+        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
+        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
+    )):
+        return 'void*'
+
+    return _scalar_name(t)
 
 ################################################################################
 # AST Node Classes
@@ -138,26 +340,9 @@ class TypeNode(BaseNode):
         self.has_template_keyword = has_template_keyword
 
     def _apply_rules_to_children(self, rules):
-        new_ta = []
-        for a in self.template_args:
-            a2 = a.apply_rules(rules)
-            if a2 is not None:
-                new_ta.append(a2)
-        self.template_args = new_ta
-
-        new_tuple = []
-        for p in self.tuple_args:
-            p2 = p.apply_rules(rules)
-            if p2 is not None:
-                new_tuple.append(p2)
-        self.tuple_args = new_tuple
-
-        new_nested = []
-        for nt in self.nested_types:
-            nt2 = nt.apply_rules(rules)
-            if nt2 is not None:
-                new_nested.append(nt2)
-        self.nested_types = new_nested
+        self.template_args = [a2 for a in self.template_args if (a2 := a.apply_rules(rules)) is not None]
+        self.tuple_args    = [p2 for p in self.tuple_args    if (p2 := p.apply_rules(rules)) is not None]
+        self.nested_types  = [n2 for n in self.nested_types  if (n2 := n.apply_rules(rules)) is not None]
 
     def __str__(self, indent=0):
         lines = []
@@ -216,12 +401,7 @@ class FunctionPointerNode(BaseNode):
     def _apply_rules_to_children(self, rules):
         if self.return_type:
             self.return_type = self.return_type.apply_rules(rules)
-        new_params = []
-        for p in self.parameters:
-            p2 = p.apply_rules(rules)
-            if p2 is not None:
-                new_params.append(p2)
-        self.parameters = new_params
+        self.parameters = [p2 for p in self.parameters if (p2 := p.apply_rules(rules)) is not None]
 
     def __str__(self, indent=0):
         lines = []
@@ -307,20 +487,8 @@ class FunctionNode(BaseNode):
     def _apply_rules_to_children(self, rules):
         if self.return_type:
             self.return_type = self.return_type.apply_rules(rules)
-
-        new_ft = []
-        for t in self.func_template_args:
-            t2 = t.apply_rules(rules)
-            if t2 is not None:
-                new_ft.append(t2)
-        self.func_template_args = new_ft
-
-        new_params = []
-        for p in self.parameters:
-            p2 = p.apply_rules(rules)
-            if p2 is not None:
-                new_params.append(p2)
-        self.parameters = new_params
+        self.func_template_args = [t2 for t in self.func_template_args if (t2 := t.apply_rules(rules)) is not None]
+        self.parameters       = [p2 for p in self.parameters       if (p2 := p.apply_rules(rules)) is not None]
 
     def __str__(self, indent=0):
         lines = []
@@ -479,11 +647,7 @@ def to_code(node, top_level=False):
         if node.func_template_args:
             inside = ', '.join(to_code(a, top_level=False) for a in node.func_template_args)
             tmpl = f'<{inside}>'
-        if node.parameters:
-            inside_params = ', '.join(to_code(p, top_level=False) for p in node.parameters)
-            param_part = f'({inside_params})'
-        else:
-            param_part = '()'
+        param_part = f'({", ".join(to_code(p, top_level=False) for p in node.parameters)})' if node.parameters else '()'
         out = f'{rt} {fn}{tmpl}{param_part}'
         if top_level:
             out += ';'
@@ -1088,7 +1252,7 @@ class ASTParser:
         return ast_nodes
 
 ################################################################################
-# vdump
+# vdump - fast AST utilities with caching
 ################################################################################
 
 def function_pointer_to_void_pointer_rule(node):
@@ -1099,15 +1263,17 @@ def function_pointer_to_void_pointer_rule(node):
         )
     return node
 
+@lru_cache(maxsize=16384)
 def extract_function_info(decl_str):
+    if not decl_str:
+        return None
     if not decl_str.endswith(';'):
         decl_str += ';'
-
     parser = ASTParser()
     parser.add_rule(function_pointer_to_void_pointer_rule)
     try:
         ast_nodes = parser.parse(decl_str)
-    except:
+    except Exception:
         return None
 
     for node in ast_nodes:
@@ -1121,7 +1287,7 @@ def extract_function_info(decl_str):
                     s = 'void*'
                 params.append(s)
             func_name = node.func_name or (node.return_type.typename if node.return_type else '')
-            return (func_name, params)
+            return (func_name, tuple(params))
 
         if isinstance(node, TypeNode):
             params = []
@@ -1132,205 +1298,20 @@ def extract_function_info(decl_str):
                 elif s == 'void' and len(node.tuple_args) > 1:
                     s = 'void*'
                 params.append(s)
-            return (node.typename, params)
-
+            return (node.typename, tuple(params))
     return None
 
-def format_name(name):
-    name = name.replace('const', '')
-    name = name.replace('volatile', '')
-    name = re.sub('`[^`\']*\'', '', name)
-    name = name.replace('::', '_')
-    name = name.replace('(', '_')
-    name = name.replace('<', '_')
-    name = name.replace(',', '_')
-    name = name.replace('>', '_')
-    name = name.replace('&', '_')
-    name = name.replace('?', '_')
-    name = name.replace('@', '_')
-    name = name.replace(')', '_')
-    name = name.replace('[', '_')
-    name = name.replace(']', '_')
-    name = re.sub('\\s+', '_', name)
-    name = re.sub('\\(.*\\*\\)\\(.*\\)', '', name)
-    name = name.replace('*', '')
-    name = re.sub('\\_+', '_', name)
-    name = name.removeprefix('__')
-    name = name.removeprefix('_')
-    name = name.removesuffix('__')
-    name = name.removesuffix('_')
-    return name
-
-def _scalar_name(t):
-    if t.is_void() or t.is_decl_void():
-        return 'void'
-    if t.is_bool() or t.is_decl_bool():
-        return 'bool'
-    if t.is_char() or t.is_decl_char():
-        return 'char' if t.is_signed() else 'unsigned char'
-    if t.is_uchar() or t.is_decl_uchar():
-        return 'unsigned char'
-    if t.is_float() or t.is_decl_float():
-        return 'float'
-    if t.is_double() or t.is_decl_double():
-        return 'double'
-    if t.is_ldouble():
-        return 'long double'
-
-    size = t.get_size()
-    if t.is_integral() or t.is_arithmetic():
-        if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
-            if t.is_int16() or t.is_decl_int16(): return 'short'
-            if t.is_int32() or t.is_decl_int32(): return 'int'
-            if t.is_int64() or t.is_decl_int64(): return 'long long'
-            if t.is_int128() or t.is_decl_int128(): return 'void*'
-            if t.is_int() or t.is_decl_int():
-                return 'int' if size != 1 else 'char'
-            return {1:'char',2:'short',4:'int',8:'long long',16:'void*'}.get(size,'int')
-        else:
-            if t.is_uint16() or t.is_decl_uint16(): return 'unsigned short'
-            if t.is_uint32() or t.is_decl_uint32(): return 'unsigned int'
-            if t.is_uint64() or t.is_decl_uint64(): return 'unsigned long long'
-            if t.is_uint128() or t.is_decl_uint128(): return 'void*'
-            if t.is_uint() or t.is_decl_uint():
-                return 'unsigned int' if size != 1 else 'unsigned char'
-            return {1:'unsigned char',2:'unsigned short',4:'unsigned int',8:'unsigned long long',16:'void*'}.get(size,'unsigned int')
-
-    if t.is_floating() or t.is_decl_floating():
-        return {4:'float',8:'double',10:'long double',16:'long double'}.get(size,'double')
-
-    return 'void*'
-
-def normalize_tinfo(t):
-    if not t.is_correct() or not t.is_well_defined():
-        return 'void*'
-
-    if t.is_func() or t.is_funcptr():
-        return 'void*'
-
-    if t.is_ptr():
-        pt = ida_typeinf.remove_pointer(t)
-        if is_builtin_type(pt):
-            qualifiers = []
-            try:
-                if pt.is_const(): qualifiers.append('const')
-                if pt.is_volatile(): qualifiers.append('volatile')
-            except Exception:
-                pass
-
-            base = _scalar_name(pt)
-            if qualifiers:
-                base = ' '.join(qualifiers + [base])
-            return base + '*'
-
-        return 'void*'
-
-    if t.is_array():
-        try:
-            et = ida_typeinf.tinfo_t()
-            if t.get_array_element(et) and is_builtin_type(et):
-                qualifiers = []
-                if et.is_const(): qualifiers.append('const')
-                if et.is_volatile(): qualifiers.append('volatile')
-                base = _scalar_name(et)
-                if qualifiers:
-                    base = ' '.join(qualifiers + [base])
-                return base + '*'
-        except Exception:
-            pass
-        return 'void*'
-
-    if any((
-        t.is_sue(), t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(),
-        t.is_complex(), t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(),
-        t.is_forward_decl(), t.is_forward_enum(), t.is_forward_struct(),
-        t.is_forward_union(), t.is_varstruct(), t.is_varmember(), t.is_vftable(),
-        t.is_sse_type(), t.is_tbyte(), t.is_unknown(), t.is_decl_array(),
-        t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
-        t.is_decl_func(), t.is_decl_struct(), t.is_decl_sue(), t.is_decl_typedef(),
-        t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(), t.is_decl_partial(),
-        t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
-        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
-        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
-        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
-    )):
-        return 'void*'
-
-    return _scalar_name(t)
-
-def is_builtin_type(t):
-    if t.is_ptr():
-        t = ida_typeinf.remove_pointer(t)
-        t.clr_decl_const_volatile()
-
-    if not t.is_correct() or not t.is_well_defined():
-        return False
-
-    if any((
-        t.is_ptr(), t.is_array(), t.is_func(), t.is_funcptr(), t.is_sue(),
-        t.is_udt(), t.is_typedef(), t.is_typeref(), t.is_aliased(), t.is_complex(),
-        t.is_bitfield(), t.is_enum(), t.is_struct(), t.is_union(), t.is_forward_decl(),
-        t.is_forward_enum(), t.is_forward_struct(), t.is_forward_union(), t.is_varstruct(),
-        t.is_varmember(), t.is_vftable(), t.is_sse_type(), t.is_tbyte(), t.is_unknown(),
-        t.is_decl_array(), t.is_decl_bitfield(), t.is_decl_complex(), t.is_decl_enum(),
-        t.is_decl_func(), t.is_decl_ptr(), t.is_decl_struct(), t.is_decl_sue(),
-        t.is_decl_typedef(), t.is_decl_udt(), t.is_decl_unknown(), t.is_decl_paf(),
-        t.is_decl_partial(), t.is_decl_tbyte(), t.is_anonymous_udt(), t.is_bitmask_enum(),
-        t.is_empty_enum(), t.is_empty_udt(), t.is_fixed_struct(), t.is_from_subtil(),
-        t.is_high_func(), t.is_purging_cc(), t.is_shifted_ptr(), t.is_small_udt(),
-        t.is_user_cc(), t.is_vararg_cc(), t.is_frame()
-    )):
-        return False
-
-    if t.is_void() or t.is_decl_void():
-        return True
-    if t.is_bool() or t.is_decl_bool():
-        return True
-    if t.is_char() or t.is_decl_char():
-        return True
-    if t.is_uchar() or t.is_decl_uchar():
-        return True
-    if t.is_float() or t.is_decl_float():
-        return True
-    if t.is_double() or t.is_decl_double():
-        return True
-    if t.is_ldouble():
-        return True
-
-    if t.is_integral() or t.is_arithmetic():
-        if t.is_signed() or (not t.is_unsigned() and not t.is_decl_uint()):
-            if t.is_int16() or t.is_decl_int16(): return True
-            if t.is_int32() or t.is_decl_int32(): return True
-            if t.is_int64() or t.is_decl_int64(): return True
-            if t.is_int128() or t.is_decl_int128(): return True
-            if t.is_int() or t.is_decl_int():
-                return True
-            
-            return False
-        else:
-            if t.is_uint16() or t.is_decl_uint16(): return True
-            if t.is_uint32() or t.is_decl_uint32(): return True
-            if t.is_uint64() or t.is_decl_uint64(): return True
-            if t.is_uint128() or t.is_decl_uint128(): return True
-            if t.is_uint() or t.is_decl_uint():
-                return True
-            
-            return False
-
-    if t.is_floating() or t.is_decl_floating():
-        return True
-
-    return False
-
+@lru_cache(maxsize=8192)
 def extract_object_name(decl_str):
+    if not decl_str:
+        return None
     if not decl_str.endswith(';'):
         decl_str += ';'
-
     parser = ASTParser()
     parser.add_rule(function_pointer_to_void_pointer_rule)
     try:
         ast_nodes = parser.parse(decl_str)
-    except:
+    except Exception:
         return 'void*'
 
     for node in ast_nodes:
@@ -1345,12 +1326,109 @@ def extract_object_name(decl_str):
             return '_'.join(node.type_node.namespaces) + ('_' if node.type_node.namespaces else '') + node.type_node.typename + ' ' + node.var_name
         if isinstance(node, FunctionPointerNode):
             return 'void*'
-
     return None
+
+################################################################################
+# Signature cache (decompile/parse once per EA)
+################################################################################
+
+class SignatureCache:
+    def __init__(self, converter_ref=None):
+        self.sig = {}  # ea -> dict(ret_str, args, base, special)
+        self.conv = converter_ref  # filled later
+
+    def attach(self, conv):
+        self.conv = conv
+
+    @lru_cache(maxsize=16384)
+    def _canon_from_demangled(self, arg: str) -> str:
+        tif = _parse_type_cached(arg)
+        if tif:
+            try:
+                if tif.is_func() or tif.is_funcptr():
+                    return 'void*'
+                if tif.is_ptr():
+                    pt = ida_typeinf.remove_pointer(tif)
+                    if pt:
+                        pt.clr_decl_const_volatile()
+                        if is_builtin_type(pt):
+                            out = re.sub(r'\s+', ' ', arg)
+                            return out.replace(' *', '*').replace(' &', '&')
+                    return 'void*'
+                if is_builtin_type(tif):
+                    return re.sub(r'\s+', ' ', arg)
+            except Exception:
+                pass
+        return 'void*'
+
+    def get(self, ea: int, demangled: str):
+        if ea in self.sig:
+            return self.sig[ea]
+
+        d = _sanitize_demangled(demangled)
+        base_name = d.split('(')[0].split('::')[-1]
+
+        # Try to get type info (prefer decompile)
+        ret_str = 'void'
+        decomp_t = None
+        try:
+            decomp = ida_hexrays.decompile(ea)
+        except Exception:
+            decomp = None
+        if decomp:
+            decomp_t = decomp.type
+            rt = decomp_t.get_rettype()
+            rt.clr_decl_const_volatile()
+            ret_str = self.conv.simplify_type(rt)
+        else:
+            f = ida_funcs.get_func(ea)
+            if f and f.prototype:
+                decomp_t = f.prototype
+                rt = decomp_t.get_rettype()
+                rt.clr_decl_const_volatile()
+                ret_str = self.conv.simplify_type(rt)
+
+        # Build args (fallback to decompiled prototype first)
+        args = []
+        if decomp_t and decomp_t.is_func():
+            try:
+                for i in range(1, decomp_t.get_nargs()):
+                    a = decomp_t.get_nth_arg(i)
+                    a.clr_decl_const_volatile()
+                    astr = self.conv.simplify_type(a)
+                    if astr == 'void' and i <= 2:
+                        astr = 'void*'
+                    args.append(astr)
+            except Exception:
+                args = []
+
+        # If demangled signature is parseable, prefer it (canonicalized & cached)
+        fi = extract_function_info(d)
+        if fi:
+            _, dargs = fi
+            args = [ self._canon_from_demangled(a) for a in dargs ]
+            # Ret stays from decompiler/prototype (more reliable)
+
+        # classify special
+        special = None
+        if d.startswith('~') or '::~' in d or 'destructor' in d:
+            special = 'destructor'
+        elif d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
+            special = 'pure'
+
+        self.sig[ea] = dict(ret=ret_str, args=tuple(args), base=base_name, special=special)
+        return self.sig[ea]
+
+SIGCACHE = SignatureCache()
+
+################################################################################
+# DeclarationConverter
+################################################################################
 
 class DeclarationConverter:
     def __init__(self):
         self.reset_state()
+        SIGCACHE.attach(self)
 
     def reset_state(self):
         self.class_map = {}
@@ -1407,11 +1485,10 @@ class DeclarationConverter:
         return 'void*'
 
     def _key_for_compare(self, idx, func, demangled, cls, offset):
-        d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
+        d = _sanitize_demangled(demangled)
 
         if d.startswith('~') or '::~' in d or 'destructor' in d:
             return None
-
         if d[:19] == '___cxa_pure_virtual' or d[:10] == '__purecall':
             return None
         if '?' in d or '@' in d or '$' in d:
@@ -1430,7 +1507,7 @@ class DeclarationConverter:
         return (base_name, ())
 
     def _collect_key_counts_from_nonzero_offsets(self, cls):
-        if ida_ida.inf_get_filetype() != ida_ida.f_MACHO:
+        if _FILETYPE != ida_ida.f_MACHO:
             return collections.Counter()
 
         cnt = collections.Counter()
@@ -1441,14 +1518,14 @@ class DeclarationConverter:
             for i, (ea, dem) in enumerate(lst):
                 if not dem:
                     continue
-                dem2 = dem.replace('`non-virtual thunk to\'', '')
+                dem2 = _sanitize_demangled(dem)
                 key = self._key_for_compare(i, ea, dem2, cls, off)
                 if key:
                     cnt[key] += 1
         return cnt
 
     def _enumerate_vfuncs_filtered(self, cls, offset, vfuncs, other_counts):
-        if ida_ida.inf_get_filetype() != ida_ida.f_MACHO or offset != 0:
+        if _FILETYPE != ida_ida.f_MACHO or offset != 0:
             return [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
 
         out = []
@@ -1456,7 +1533,7 @@ class DeclarationConverter:
         for phys_i, (ea, dem) in enumerate(vfuncs):
             if not dem:
                 continue
-            dem2 = dem.replace('`non-virtual thunk to\'', '')
+            dem2 = _sanitize_demangled(dem)
             key = self._key_for_compare(phys_i, ea, dem2, cls, offset)
             if key and other_counts.get(key, 0) > 0:
                 other_counts[key] -= 1
@@ -1464,6 +1541,227 @@ class DeclarationConverter:
             out.append((logical, phys_i, ea, dem))
             logical += 1
         return out
+
+    # ---------- shared low-level utilities ----------
+
+    def _normalize_operator_name(self, base_name, idx):
+        name = (base_name or '').strip()
+        if name.startswith('operator'):
+            return f'operator_{idx:010}'
+        return name
+
+    def parse_type(self, s):
+        return _parse_type_cached(s)
+
+    def is_known_type(self, tif):
+        if not tif:
+            return False
+        if tif.is_ptr():
+            return True
+        tif = ida_typeinf.remove_pointer(tif)
+        if tif:
+            if tif.is_void():
+                return True
+            return tif.get_realtype(full=True)
+        return False
+
+    def simplify_type(self, tif):
+        if not tif:
+            return 'void'
+        tif.clr_decl_const_volatile()
+        name = normalize_tinfo(tif)
+        name = name.replace('_anonymous_namespace_::', '')
+        if not self.is_known_type(tif):
+            name = format_name(name)
+            self.declare.add(name)
+        return name
+
+    # ---------- Full class need check ----------
+
+    def _need_full_class(self, filtered, full_list) -> bool:
+        """
+        True, если набор виртуальных функций (по очищенным деманглам и порядку)
+        отличается между filtered и полным списком.
+        """
+        f1 = [ _sanitize_demangled(d) for _, _, _, d in filtered if d ]
+        f2 = [ _sanitize_demangled(d) for _, _, ea, d in full_list if d ]
+        return f1 != f2
+
+    # ---------- codegen helpers ----------
+
+    def _next_unique_name(self, cls, offset, func_name):
+        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
+        self.used_func_names[(cls, offset)][func_name] += 1
+        count = self.used_func_names[(cls, offset)][func_name]
+        return f'{func_name}_{count}' if count > 1 else func_name
+
+    def _emit_virtual_decl(self, idx, ea, demangled, cls, offset, dtor_class_name):
+        d = _sanitize_demangled(demangled)
+
+        if d[:19] == '___cxa_pure_virtual' or d[:10] == '__purecall':
+            return f'virtual void PureStub_{idx:010}() = 0;'
+
+        if d.startswith('~') or 'destructor' in d or '~' in d:
+            return f'virtual ~{dtor_class_name}() = 0;'
+
+        if '?' in d or '@' in d or '$' in d:
+            return f'virtual void InvalidStub_{idx:010}() = 0;'
+
+        sig = SIGCACHE.get(ea, d)
+        ret_str = sig['ret']
+        base = sig['base']
+        args = list(sig['args'])
+
+        if ida_bytes.has_dummy_name(ida_bytes.get_flags(ea)):
+            return f'virtual void Stub_{idx:010}({", ".join(args)}) = 0;'
+
+        if d[:8] == 'nullsub_':
+            return f'virtual void NullStub_{idx:010}({", ".join(args)}) = 0;'
+
+        func_name = self._normalize_operator_name(base, idx)
+        func_name = self._next_unique_name(cls, offset, func_name)
+        return f'virtual {ret_str} {func_name}({", ".join(args)}) = 0;'
+
+    def _emit_static_invoke(self, idx_logical, ret_str, args):
+        if args:
+            nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+            naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+            return (
+                f'static {ret_str} INVOKE(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*, {", ".join(args)})>'
+                f'(pVTable[{idx_logical} + nFixOffset])(pThis, {", ".join(naargs)}); }};'
+            )
+        else:
+            return (
+                f'static {ret_str} INVOKE(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*)>'
+                f'(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+            )
+
+    def _emit_static_decl(self, idx_logical, ea, demangled, cls, offset, name_prefix, dtor_class_name):
+        d = _sanitize_demangled(demangled)
+
+        if d[:19] == '___cxa_pure_virtual' or d[:10] == '__purecall':
+            return (
+                f'static void static_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+            )
+
+        if d.startswith('~') or 'destructor' in d or '~' in d:
+            return (
+                f'static void static_destructor_{dtor_class_name}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+            )
+
+        if '?' in d or '@' in d or '$' in d:
+            return (
+                f'static void static_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+            )
+
+        sig = SIGCACHE.get(ea, d)
+        ret_str = sig['ret']
+        base = sig['base']
+        args = list(sig['args'])
+
+        if ida_bytes.has_dummy_name(ida_bytes.get_flags(ea)):
+            if args:
+                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+                return (
+                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_logical} + nFixOffset])'
+                    f'(pThis, {", ".join(naargs)}); }};'
+                )
+            else:
+                return (
+                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+                )
+
+        if d[:8] == 'nullsub_':
+            if args:
+                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
+                return (
+                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_logical} + nFixOffset])'
+                    f'(pThis, {", ".join(naargs)}); }};'
+                )
+            else:
+                return (
+                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
+                )
+
+        func_name = self._normalize_operator_name(base, idx_logical)
+        func_name = f'{name_prefix}{func_name}'
+        func_name = self._next_unique_name(cls, offset, func_name)
+
+        # Expand INVOKE template with concrete name
+        invoke = self._emit_static_invoke(idx_logical, ret_str, args).replace('INVOKE', func_name)
+        return invoke
+
+    def _emit_get_decl(self, idx_logical, ea, demangled, cls, offset, name_prefix, dtor_class_name):
+        d = _sanitize_demangled(demangled)
+
+        if d[:19] == '___cxa_pure_virtual' or d[:10] == '__purecall':
+            return (
+                f'static void* get_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_logical} + nFixOffset]; }};'
+            )
+
+        if d.startswith('~') or 'destructor' in d or '~' in d:
+            return (
+                f'static void* get_destructor_{dtor_class_name}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_logical} + nFixOffset]; }};'
+            )
+
+        if '?' in d or '@' in d or '$' in d:
+            return (
+                f'static void* get_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_logical} + nFixOffset]; }};'
+            )
+
+        base = SIGCACHE.get(ea, d)['base']
+
+        if ida_bytes.has_dummy_name(ida_bytes.get_flags(ea)):
+            return (
+                f'static void* get_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_logical} + nFixOffset]; }};'
+            )
+
+        if d[:8] == 'nullsub_':
+            return (
+                f'static void* get_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
+                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+                f'return pVTable[{idx_logical} + nFixOffset]; }};'
+            )
+
+        func_name = self._normalize_operator_name(base, idx_logical)
+        func_name = f'{name_prefix}{func_name}'
+        func_name = self._next_unique_name(cls, offset, func_name)
+
+        return (
+            f'static void* {func_name}(void* pThis, int nFixOffset) {{ '
+            f'void** pVTable = *reinterpret_cast<void***>(pThis); '
+            f'return pVTable[{idx_logical} + nFixOffset]; }};'
+        )
+
+    # ---------- public generation ----------
 
     def generate_declarations(self):
         queue = collections.deque([cls for cls, deg in self.in_degree.items() if deg == 0])
@@ -1490,31 +1788,32 @@ class DeclarationConverter:
                 offset_name_full  = f'{cls}_Full_{offset:08X}'
                 class_name_map[(cls, offset)] = offset_name
 
+                # forward-decl: базовый всегда
                 self.forward_decls.add(f'class {offset_name}; // OFFSET: {offset:08X}')
-                self.forward_decls.add(f'class {offset_name_full}; // OFFSET: {offset:08X}')
 
                 vfuncs = self.class_vfuncs[cls][offset]
+
+                # ------ filtered (stable logical indices across all sections) ------
+                filtered = self._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
 
                 decl_lines = [
                     f'class {offset_name} {{ // OFFSET: {offset:08X}',
                     'public:'
                 ]
 
-                filtered = self._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
-
                 for log_i, phys_i, func, demangled in filtered:
                     if not demangled:
                         continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_function(log_i, func, d2, cls, offset, offset_name)
+                    d2 = _sanitize_demangled(demangled)
+                    decl = self._emit_virtual_decl(log_i, func, d2, cls, offset, offset_name)
                     decl_lines.append(f'    // {log_i:>10} - {d2}')
                     decl_lines.append(f'    {decl}\n')
 
                 for log_i, phys_i, func, demangled in filtered:
                     if not demangled:
                         continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset, offset_name)
+                    d2 = _sanitize_demangled(demangled)
+                    decl = self._emit_static_decl(log_i, func, d2, cls, offset, 'static_', offset_name)
                     decl_lines.append(f'    {decl}')
 
                 decl_lines.append('')
@@ -1522,48 +1821,55 @@ class DeclarationConverter:
                 for log_i, phys_i, func, demangled in filtered:
                     if not demangled:
                         continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset, offset_name)
+                    d2 = _sanitize_demangled(demangled)
+                    decl = self._emit_get_decl(log_i, func, d2, cls, offset, 'get_', offset_name)
                     decl_lines.append(f'    {decl}')
 
                 decl_lines.append('};')
                 class_declarations.append('\n'.join(decl_lines))
 
+                # сброс уникальных имён перед проверкой Full
                 self.used_func_names[(cls, offset)] = {}
 
-                decl_lines_full = [
-                    f'class {offset_name_full} {{ // OFFSET: {offset:08X}',
-                    'public:'
-                ]
-
+                # ------ full (no filtering; keep destructor de-dup behavior) ------
                 full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+                need_full = self._need_full_class(filtered, full_list)
 
-                for log_i, phys_i, func, demangled in full_list:
-                    if not demangled:
-                        continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_function(log_i, func, d2, cls, offset, offset_name_full)
-                    decl_lines_full.append(f'    // {log_i:>10} - {d2}')
-                    decl_lines_full.append(f'    {decl}\n')
+                if need_full:
+                    # forward-decl только если отличается
+                    self.forward_decls.add(f'class {offset_name_full}; // OFFSET: {offset:08X}')
 
-                for log_i, phys_i, func, demangled in full_list:
-                    if not demangled:
-                        continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset, offset_name_full)
-                    decl_lines_full.append(f'    {decl}')
+                    decl_lines_full = [
+                        f'class {offset_name_full} {{ // OFFSET: {offset:08X}',
+                        'public:'
+                    ]
 
-                decl_lines_full.append('')
+                    for log_i, phys_i, func, demangled in full_list:
+                        if not demangled:
+                            continue
+                        d2 = _sanitize_demangled(demangled)
+                        decl = self._emit_virtual_decl(log_i, func, d2, cls, offset, offset_name_full)
+                        decl_lines_full.append(f'    // {log_i:>10} - {d2}')
+                        decl_lines_full.append(f'    {decl}\n')
 
-                for log_i, phys_i, func, demangled in full_list:
-                    if not demangled:
-                        continue
-                    d2 = demangled.replace('`non-virtual thunk to\'', '')
-                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset, offset_name_full)
-                    decl_lines_full.append(f'    {decl}')
+                    for log_i, phys_i, func, demangled in full_list:
+                        if not demangled:
+                            continue
+                        d2 = _sanitize_demangled(demangled)
+                        decl = self._emit_static_decl(log_i, func, d2, cls, offset, 'static_', offset_name_full)
+                        decl_lines_full.append(f'    {decl}')
 
-                decl_lines_full.append('};')
-                class_declarations.append('\n'.join(decl_lines_full))
+                    decl_lines_full.append('')
+
+                    for log_i, phys_i, func, demangled in full_list:
+                        if not demangled:
+                            continue
+                        d2 = _sanitize_demangled(demangled)
+                        decl = self._emit_get_decl(log_i, func, d2, cls, offset, 'get_', offset_name_full)
+                        decl_lines_full.append(f'    {decl}')
+
+                    decl_lines_full.append('};')
+                    class_declarations.append('\n'.join(decl_lines_full))
 
         for cls in self.declare:
             if cls not in sorted_classes:
@@ -1574,684 +1880,35 @@ class DeclarationConverter:
                '\n\n' + \
                '\n\n'.join(class_declarations)
 
-    def _normalize_operator_name(self, base_name, idx):
-        name = base_name.strip()
-        if name.startswith('operator'):
-            return f'operator_{idx:010}'
-        return name
-
-    def canonicalize_arg_from_demangled(self, s):
-        s = re.sub(r'\bvolatile\b', '', s).strip() 
-        tif = self.parse_type(s)
-        if tif:
-            if tif.is_func():
-                return 'void*'
-            if tif.is_funcptr():
-                return 'void*'
-
-            if tif.is_ptr():
-                pt = ida_typeinf.remove_pointer(tif)
-                if pt:
-                    pt.clr_decl_const_volatile()
-                    if is_builtin_type(pt):
-                        out = re.sub(r'\s+', ' ', s)
-                        out = out.replace(' *', '*').replace(' &', '&')
-                        return out
-                return 'void*'
-
-            if is_builtin_type(tif):
-                return re.sub(r'\s+', ' ', s)
-
-            return 'void*'
-
-        return 'void*'
-
-    def process_function(self, idx, func, demangled, cls, offset, dtor_class_name=None):
-        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
-
-        if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return f'virtual void PureStub_{idx:010}() = 0;'
-
-        if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return f'virtual ~{name_for_dtor}() = 0;'
-
-        if '?' in demangled or '@' in demangled or '$' in demangled:
-            return f'virtual void InvalidStub_{idx:010}() = 0;'
-
-        type = None
-
-        try:
-            decompiled = ida_hexrays.decompile(func)
-        except Exception:
-            decompiled = None
-        if decompiled:
-            type = decompiled.type
-            ret_type = type.get_rettype()
-            ret_type.clr_decl_const_volatile()
-            ret_str = self.simplify_type(ret_type)
-        else:
-            if f := ida_funcs.get_func(func):
-                type = f.prototype
-            ret_str = 'void'
-
-        if not type:
-            return f'virtual void InvalidStub_{idx:010}() = 0;'
-
-        decompiled_args = []
-        for i in range(1, type.get_nargs()):
-            arg = type.get_nth_arg(i)
-            arg.clr_decl_const_volatile()
-            arg_str = self.simplify_type(arg)
-            if arg_str == 'void' and i <= 2:
-                arg_str = 'void*'
-            decompiled_args.append(arg_str)
-
-        args = decompiled_args
-
-        func_info = extract_function_info(demangled)
-        if func_info:
-            func_name, dargs = func_info
-            func_name = self._normalize_operator_name(func_name, idx)
-            args = [ self.canonicalize_arg_from_demangled(a) for a in dargs ]
-        else:
-            decompiled_args = []
-            if type:
-                for i in range(1, type.get_nargs()):
-                    arg = type.get_nth_arg(i)
-                    arg.clr_decl_const_volatile()
-                    arg_str = self.simplify_type(arg)
-                    if arg_str == 'void' and i <= 2:
-                        arg_str = 'void*'
-                    decompiled_args.append(arg_str)
-            args = decompiled_args
-            func_name = demangled.split('(')[0].split('::')[-1]
-            func_name = self._normalize_operator_name(func_name, idx)
-
-        if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            return f'virtual void Stub_{idx:010}({", ".join(args)}) = 0;'
-
-        if demangled[:8] == 'nullsub_':
-            return f'virtual void NullStub_{idx:010}({", ".join(args)}) = 0;'
-
-        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
-        self.used_func_names[(cls, offset)][func_name] += 1
-        count = self.used_func_names[(cls, offset)][func_name]
-        final_name = f'{func_name}_{count}' if count > 1 else func_name
-
-        return f'virtual {ret_str} {final_name}({", ".join(args)}) = 0;'
-
-    def process_static_function(self, idx_logical, idx_callslot, func, demangled, cls, offset, dtor_class_name=None):
-        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
-
-        if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return (
-                f'static void static_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-            )
-
-        if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return (
-                f'static void static_destructor_{name_for_dtor}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-            )
-
-        if '?' in demangled or '@' in demangled or '$' in demangled:
-            return (
-                f'static void static_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-            )
-
-        type = None
-
-        try:
-            decompiled = ida_hexrays.decompile(func)
-        except Exception:
-            decompiled = None
-        if decompiled:
-            type = decompiled.type
-            ret_type = type.get_rettype()
-            ret_type.clr_decl_const_volatile()
-            ret_str = self.simplify_type(ret_type)
-        else:
-            if f := ida_funcs.get_func(func):
-                type = f.prototype
-            ret_str = 'void'
-
-        if not type:
-            return (
-                f'static void static_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-            )
-
-        decompiled_args = []
-        for i in range(1, type.get_nargs()):
-            arg = type.get_nth_arg(i)
-            arg.clr_decl_const_volatile()
-            arg_str = self.simplify_type(arg)
-            if arg_str == 'void' and i <= 2:
-                arg_str = 'void*'
-            decompiled_args.append(arg_str)
-
-        args = decompiled_args
-
-        func_info = extract_function_info(demangled)
-        if func_info:
-            func_name, dargs = func_info
-            func_name = self._normalize_operator_name(func_name, idx_logical)
-            func_name = 'static_' + func_name
-            args = [ self.canonicalize_arg_from_demangled(a) for a in dargs ]
-        else:
-            decompiled_args = []
-            if type:
-                for i in range(1, type.get_nargs()):
-                    arg = type.get_nth_arg(i)
-                    arg.clr_decl_const_volatile()
-                    arg_str = self.simplify_type(arg)
-                    if arg_str == 'void' and i <= 2:
-                        arg_str = 'void*'
-                    decompiled_args.append(arg_str)
-            args = decompiled_args
-            func_name = demangled.split('(')[0].split('::')[-1]
-            func_name = self._normalize_operator_name(func_name, idx_logical)
-            func_name = 'static_' + func_name
-
-        if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            if args:
-                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
-                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
-                return (
-                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
-                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_callslot} + nFixOffset])'
-                    f'(pThis, {", ".join(naargs)}); }};'
-                )
-            else:
-                return (
-                    f'static void static_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-                )
-
-        if demangled[:8] == 'nullsub_':
-            if args:
-                nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
-                naargs = [f'a{i}' for i in range(1, len(args) + 1)]
-                return (
-                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
-                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                    f'reinterpret_cast<void(__thiscall*)(void*, {", ".join(args)})>(pVTable[{idx_callslot} + nFixOffset])'
-                    f'(pThis, {", ".join(naargs)}); }};'
-                )
-            else:
-                return (
-                    f'static void static_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                    f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                    f'reinterpret_cast<void(__thiscall*)(void*)>(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-                )
-
-        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
-        self.used_func_names[(cls, offset)][func_name] += 1
-        count = self.used_func_names[(cls, offset)][func_name]
-        final_name = f'{func_name}_{count}' if count > 1 else func_name
-
-        if args:
-            nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
-            naargs = [f'a{i}' for i in range(1, len(args) + 1)]
-            return (
-                f'static {ret_str} {final_name}(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*, {", ".join(args)})>'
-                f'(pVTable[{idx_callslot} + nFixOffset])(pThis, {", ".join(naargs)}); }};'
-            )
-        else:
-            return (
-                f'static {ret_str} {final_name}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*)>'
-                f'(pVTable[{idx_callslot} + nFixOffset])(pThis); }};'
-            )
-
-    def process_get_function(self, idx_logical, idx_callslot, func, demangled, cls, offset, dtor_class_name=None):
-        name_for_dtor = dtor_class_name or f'{cls}_{offset:08X}'
-
-        if demangled[:19] == '___cxa_pure_virtual' or demangled[:10] == '__purecall':
-            return (
-                f'static void* get_PureStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        if demangled.startswith('~') or 'destructor' in demangled or '~' in demangled:
-            return (
-                f'static void* get_destructor_{name_for_dtor}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        if '?' in demangled or '@' in demangled or '$' in demangled:
-            return (
-                f'static void* get_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        type = None
-        try:
-            decompiled = ida_hexrays.decompile(func)
-        except Exception:
-            decompiled = None
-        if decompiled:
-            type = decompiled.type
-            ret_type = type.get_rettype()
-            ret_type.clr_decl_const_volatile()
-        else:
-            if f := ida_funcs.get_func(func):
-                type = f.prototype
-
-        if not type:
-            return (
-                f'static void* get_InvalidStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        func_info = extract_function_info(demangled)
-        if func_info:
-            func_name, _ = func_info
-            func_name = self._normalize_operator_name(func_name, idx_logical)
-            func_name = 'get_' + func_name
-        else:
-            func_name = demangled.split('(')[0].split('::')[-1]
-            func_name = self._normalize_operator_name(func_name, idx_logical)
-            func_name = 'get_' + func_name
-
-        if ida_bytes.has_dummy_name(ida_bytes.get_flags(func)):
-            return (
-                f'static void* get_Stub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        if demangled[:8] == 'nullsub_':
-            return (
-                f'static void* get_NullStub_{idx_logical:010}(void* pThis, int nFixOffset) {{ '
-                f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-            )
-
-        self.used_func_names.setdefault((cls, offset), {}).setdefault(func_name, 0)
-        self.used_func_names[(cls, offset)][func_name] += 1
-        count = self.used_func_names[(cls, offset)][func_name]
-        final_name = f'{func_name}_{count}' if count > 1 else func_name
-
-        return (
-            f'static void* {final_name}(void* pThis, int nFixOffset) {{ '
-            f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-            f'return pVTable[{idx_callslot} + nFixOffset]; }};'
-        )
-
-    def parse_type(self, s):
-        tif = ida_typeinf.tinfo_t()
-        if ida_typeinf.parse_decl(tif, None, s, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
-            return None
-        if tif.is_ptr():
-            t = tif
-            lt = tif
-            while t and t.is_ptr():
-                lt = t
-                t = t.get_pointed_object()
-            tif = lt
-        return tif
-
-    def is_known_type(self, tif):
-        if not tif:
-            return False
-
-        if tif.is_ptr():
-            return True
-
-        tif = ida_typeinf.remove_pointer(tif)
-        if tif:
-            if tif.is_void():
-                return True
-            return tif.get_realtype(full=True)
-
-        return False
-
-    def simplify_type(self, tif):
-        if not tif:
-            return 'void'
-
-        tif.clr_decl_const_volatile()
-
-        name = normalize_tinfo(tif)
-        name = name.replace('_anonymous_namespace_::', '')
-        if not self.is_known_type(tif):
-            name = format_name(name)
-            self.declare.add(name)
-        return name
-
-if DUMP_FOR_SOURCE_PYTHON:
-    def _tinfo_is_char_like(t):
-        try:
-            return t.is_char() or t.is_decl_char() or t.is_uchar() or t.is_decl_uchar()
-        except Exception:
-            return False
-
-    def _tinfo_pointee(t):
-        try:
-            if t and t.is_ptr():
-                return t.get_pointed_object()
-        except Exception:
-            pass
-        return None
-
-    def _tinfo_size(t):
-        try:
-            return t.get_size()
-        except Exception:
-            return 0
-
-    def _tinfo_is_signed(t):
-        try:
-            if t.is_signed(): return True
-            if t.is_unsigned(): return False
-            return False
-        except Exception:
-            return False
-
-    def tinfo_to_datatype_enum(t):
-        try:
-            if t.is_ref():
-                try:
-                    base = ida_typeinf.tinfo_t(t)
-                    base.remove_ref()
-                    return tinfo_to_datatype_enum(base)
-                except Exception:
-                    return 'DataType.POINTER'
-            if t.is_array():
-                return 'DataType.POINTER'
-        except Exception:
-            pass
-
-        if not t or (not t.is_correct()) or (not t.is_well_defined()):
-            return 'DataType.POINTER'
-
-        try:
-            if t.is_ptr():
-                pt = _tinfo_pointee(t)
-                if pt and _tinfo_is_char_like(pt):
-                    return 'DataType.STRING'
-                return 'DataType.POINTER'
-        except Exception:
-            pass
-
-        if t.is_void() or t.is_decl_void():
-            return 'DataType.VOID'
-        if t.is_bool() or t.is_decl_bool():
-            return 'DataType.BOOL'
-        if t.is_float() or t.is_decl_float():
-            return 'DataType.FLOAT'
-        if t.is_double() or t.is_decl_double():
-            return 'DataType.DOUBLE'
-
-        if t.is_integral() or t.is_arithmetic():
-            sz = _tinfo_size(t)
-            sign = _tinfo_is_signed(t)
-            if sz == 1:
-                return 'DataType.CHAR' if sign else 'DataType.UCHAR'
-            if sz == 2:
-                return 'DataType.SHORT' if sign else 'DataType.USHORT'
-            if sz == 4:
-                return 'DataType.INT' if sign else 'DataType.UINT'
-            if sz == 8:
-                return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
-            return 'DataType.POINTER'
-
-        return 'DataType.POINTER'
-
-    class PythonEmitter:
-        def __init__(self, conv):
-            self.conv = conv
-            self.used_func_names = {}
-
-        def _normalize_name(self, cls, offset, base_name, idx):
-            bn = (base_name or '').strip()
-            if bn.startswith('~') or '::~' in bn:
-                name = 'destructor'
-                key = (cls, offset, name)
-                self.used_func_names.setdefault(key, 0)
-                self.used_func_names[key] += 1
-                return name
-
-            name = bn
-            name = base_name.strip()
-            if name.startswith('operator'):
-                name = f'operator_{idx:010}'
-            name = re.sub(r'[^0-9A-Za-z_]', '_', name)
-            name = re.sub(r'__+', '_', name).strip('_')
-            if not name:
-                name = f'Method_{idx:010}'
-
-            key = (cls, offset, name)
-            self.used_func_names.setdefault(key, 0)
-            self.used_func_names[key] += 1
-            if self.used_func_names[key] > 1:
-                name = f'{name}_{self.used_func_names[key]}'
-            return name
-
-        def _extract_signature_datatypes(self, func_ea, demangled):
-            ret_dt = 'DataType.VOID'
-            arg_dts = []
-            conv_str = 'Convention.THISCALL'
-
-            tinfo = None
-            try:
-                decomp = ida_hexrays.decompile(func_ea)
-            except Exception:
-                decomp = None
-            if decomp:
-                tinfo = decomp.type
-            else:
-                f = ida_funcs.get_func(func_ea)
-                if f and f.prototype:
-                    tinfo = f.prototype
-
-            if tinfo and tinfo.is_func():
-                try:
-                    ret_dt = tinfo_to_datatype_enum(tinfo.get_rettype())
-                except Exception:
-                    ret_dt = 'DataType.VOID'
-
-            fi = extract_function_info(demangled)
-            if fi:
-                _, dargs = fi
-
-                def _dt_from_demangled_arg_strict(a: str) -> str:
-                    tif = self.conv.parse_type(a)
-                    if tif:
-                        try:
-                            if tif.is_func():
-                                return 'DataType.POINTER'
-                            if tif.is_funcptr():
-                                return 'DataType.POINTER'
-
-                            if tif.is_ptr():
-                                pt = ida_typeinf.remove_pointer(tif)
-                                if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
-                                    return 'DataType.STRING'
-                                return 'DataType.POINTER'
-
-                            if is_builtin_type(tif):
-                                return tinfo_to_datatype_enum(tif)
-                        except Exception:
-                            pass
-
-                    return 'DataType.POINTER'
-
-                arg_dts = [_dt_from_demangled_arg_strict(a) for a in dargs]
-                return ret_dt, arg_dts, conv_str
-
-            if tinfo and tinfo.is_func():
-                try:
-                    nargs = tinfo.get_nargs()
-                except Exception:
-                    nargs = 0
-
-                for i in range(1, nargs):
-                    try:
-                        a_t = tinfo.get_nth_arg(i)
-                        a_t.clr_decl_const_volatile()
-                        arg_dts.append(tinfo_to_datatype_enum(a_t))
-                    except Exception:
-                        arg_dts.append('DataType.POINTER')
-
-                return ret_dt, arg_dts, conv_str
-
-            return ret_dt, arg_dts, conv_str
-
-        def _is_pure_or_destructor(self, demangled):
-            d = (demangled or '').replace('`non-virtual thunk to\'', '').strip()
-            if d.startswith('~') or '::~' in d or 'destructor' in d:
-                return 'destructor'
-            if d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
-                return 'pure'
-            return None
-
-        def generate(self, class_vfuncs):
-            lines = []
-
-            lines.append('from memory import DataType, Convention')
-            lines.append('from memory import manager, CustomType')
-            lines.append('')
-            lines.append('')
-
-            indegree = dict(self.conv.in_degree)
-            queue = collections.deque([cls for cls, deg in indegree.items() if deg == 0])
-            sorted_classes = []
-            while queue:
-                cls = queue.popleft()
-                sorted_classes.append(cls)
-                for derived in self.conv.reverse_graph.get(cls, []):
-                    indegree[derived] -= 1
-                    if indegree[derived] == 0:
-                        queue.append(derived)
-
-            for cls in sorted_classes:
-                if cls not in class_vfuncs:
-                    continue
-
-                other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
-
-                for offset, vfuncs in class_vfuncs[cls].items():
-                    py_cls_name = f'{cls}_{offset:08X}'
-                    lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
-
-                    filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
-
-                    if not filtered:
-                        lines.append('    pass')
-                        lines.append('')
-                    else:
-                        for logical_idx, phys_idx, func_ea, demangled in filtered:
-                            if not demangled:
-                                continue
-                            base = demangled.split('(')[0].split('::')[-1]
-
-                            special = self._is_pure_or_destructor(demangled)
-                            if special == 'destructor':
-                                lines.append(
-                                    f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                )
-                                continue
-                            if special == 'pure':
-                                lines.append(
-                                    f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                )
-                                continue
-
-                            method_name = self._normalize_name(cls, offset, base, logical_idx)
-                            ret_dt, arg_dts, conv_str = self._extract_signature_datatypes(func_ea, demangled)
-                            args_repr = ', '.join(arg_dts)
-                            lines.append(
-                                f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, {conv_str})'
-                            )
-                        lines.append('')
-
-                    self.used_func_names = {}
-
-                    py_cls_name_full = f'{cls}_Full_{offset:08X}'
-                    lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
-
-                    full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
-
-                    if not full_list:
-                        lines.append('    pass')
-                        lines.append('')
-                        continue
-
-                    for logical_idx, phys_idx, func_ea, demangled in full_list:
-                        if not demangled:
-                            continue
-                        base = demangled.split('(')[0].split('::')[-1]
-
-                        special = self._is_pure_or_destructor(demangled)
-                        if special == 'destructor':
-                            lines.append(
-                                f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                            )
-                            continue
-                        if special == 'pure':
-                            lines.append(
-                                f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                            )
-                            continue
-
-                        method_name = self._normalize_name(cls, offset, base, logical_idx)
-                        ret_dt, arg_dts, conv_str = self._extract_signature_datatypes(func_ea, demangled)
-                        args_repr = ', '.join(arg_dts)
-                        lines.append(
-                            f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, {conv_str})'
-                        )
-
-                    lines.append('')
-
-            return '\n'.join(lines)
+################################################################################
+# vtable scanning
+################################################################################
 
 def get_vtable_functions(vtable):
-
     funcs = []
-    is_64bit = ida_ida.inf_is_64bit()
     i = 0
     destructor_count = 0
 
-    filetype = ida_ida.inf_get_filetype()
-
-    if filetype == ida_ida.f_ELF or filetype == ida_ida.f_MACHO: # ELF / MACHO
+    if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
         ___cxa_pure_virtual = ida_name.get_name_ea(0, '___cxa_pure_virtual')
 
     while True:
-        if is_64bit:
+        # is entry a valid offset?
+        if _IS64:
             if not ida_bytes.is_off(ida_bytes.get_flags(vtable + 8 * i), 0):
                 break
+            func = ida_bytes.get_qword(vtable + 8 * i)
         else:
             if not ida_bytes.is_off(ida_bytes.get_flags(vtable + 4 * i), 0):
                 break
-
-        if is_64bit:
-            func = ida_bytes.get_qword(vtable + 8 * i)
-        else:
             func = ida_bytes.get_dword(vtable + 4 * i)
 
+        # validity of target
         if not ida_funcs.get_func(func):
-            if filetype == ida_ida.f_ELF or filetype == ida_ida.f_MACHO:
+            if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
                 if func != ___cxa_pure_virtual:
                     break
-            elif filetype == ida_ida.f_PE:
+            elif _FILETYPE == ida_ida.f_PE:
                 flags = ida_bytes.get_flags(func)
                 if not ida_bytes.is_code(flags):
                     break
@@ -2261,7 +1918,7 @@ def get_vtable_functions(vtable):
             i += 1
             continue
 
-        if demangled and '::~' in demangled:
+        if '::~' in demangled:
             destructor_count += 1
             if destructor_count == 2:
                 i += 1
@@ -2281,10 +1938,7 @@ def get_vtable_functions(vtable):
 def find_type_infos():
     type_infos = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-
-    if filetype == ida_ida.f_ELF or filetype == ida_ida.f_MACHO: # ELF / MACHO
+    if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
         type_addresses = (
             ida_name.get_name_ea(ida_idaapi.BADADDR, '__ZTVN10__cxxabiv117__class_type_infoE'),    # Single
             ida_name.get_name_ea(ida_idaapi.BADADDR, '__ZTVN10__cxxabiv120__si_class_type_infoE'), # One parent
@@ -2298,7 +1952,7 @@ def find_type_infos():
             type_reference = ida_xref.get_first_dref_to(type_address)
             while is_valid_address(type_reference):
 
-                if is_64bit:
+                if _IS64:
                     name_address = ida_bytes.get_qword(type_reference + 8)
                 else:
                     name_address = ida_bytes.get_dword(type_reference + 4)
@@ -2338,7 +1992,6 @@ def get_typeinfo_bases(typeinfo_address, type_infos, visited=None):
         ida_name.get_name_ea(ida_idaapi.BADADDR, '__ZTVN10__cxxabiv121__vmi_class_type_infoE'),
     ]
     
-    is_64bit = ida_ida.inf_is_64bit()
     type_base = ida_name.get_name_base_ea(typeinfo_address, 0)
     bases = []
     name = None
@@ -2354,29 +2007,23 @@ def get_typeinfo_bases(typeinfo_address, type_infos, visited=None):
     if type_base == TYPE_INFO_ADDRESSES[0]:
         pass
     elif type_base == TYPE_INFO_ADDRESSES[1]:
-        if is_64bit:
-            base_address = ida_bytes.get_qword(typeinfo_address + 16)
-        else:
-            base_address = ida_bytes.get_dword(typeinfo_address + 8)
-        
+        base_address = ida_bytes.get_qword(typeinfo_address + 16) if _IS64 else ida_bytes.get_dword(typeinfo_address + 8)
         base_node = get_typeinfo_bases(base_address, type_infos, visited)
         if base_node:
             bases.append(base_node)
     elif type_base == TYPE_INFO_ADDRESSES[2]:
-        if is_64bit:
+        if _IS64:
             base_count = ida_bytes.get_dword(typeinfo_address + 20)
             base_offset = 24
-            entry_size = 16
+            entry_size  = 16
         else:
             base_count = ida_bytes.get_dword(typeinfo_address + 12)
             base_offset = 16
-            entry_size = 8
+            entry_size  = 8
         
         for i in range(base_count):
-            if is_64bit:
-                base_address = ida_bytes.get_qword(typeinfo_address + base_offset + i * entry_size)
-            else:
-                base_address = ida_bytes.get_dword(typeinfo_address + base_offset + i * entry_size)
+            base_address = ida_bytes.get_qword(typeinfo_address + base_offset + i * entry_size) if _IS64 \
+                           else ida_bytes.get_dword(typeinfo_address + base_offset + i * entry_size)
 
             if base_address == typeinfo_address:
                 continue
@@ -2391,57 +2038,37 @@ def get_typeinfo_bases(typeinfo_address, type_infos, visited=None):
 def find_vtables_typeinfo(typeinfo):
     vtables = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-
-    if filetype == ida_ida.f_ELF or filetype == ida_ida.f_MACHO: # ELF / MACHO
+    if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
         vtable_reference = ida_xref.get_first_dref_to(typeinfo)
         while is_valid_address(vtable_reference):
-            if is_64bit:
-                offset = ida_bytes.get_qword(vtable_reference - 8)
-            else:
-                offset = ida_bytes.get_dword(vtable_reference - 4)
+            offset = ida_bytes.get_qword(vtable_reference - 8) if _IS64 else ida_bytes.get_dword(vtable_reference - 4)
 
             if offset != 0 and offset <= 0x7FFFFFFF:
-                if is_64bit:
+                if _IS64:
                     if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference - 8), 0):
-                        vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                        continue
+                        vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
                 else:
                     if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference - 4), 0):
-                        vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                        continue
+                        vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
 
-            if is_64bit:
-                offset = offset.to_bytes(8, byteorder='little', signed=False)
-            else:
-                offset = offset.to_bytes(4, byteorder='little', signed=False)
-
-            offset = int(-1 * int.from_bytes(offset, byteorder='little', signed=True))
-            if offset < 0: # HACK: NOT GOOD! But works...
+            offset = int(-1 * int.from_bytes((offset if _IS64 else offset).to_bytes(8 if _IS64 else 4, 'little', signed=False),
+                                             byteorder='little', signed=True))
+            if offset < 0:
                 vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
                 continue
 
-            if is_64bit:
+            if _IS64:
                 if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference + 8), 0):
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
                 if not ida_funcs.get_func(ida_bytes.get_qword(vtable_reference + 8)):
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
             else:
                 if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference + 4), 0):
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
                 if not ida_funcs.get_func(ida_bytes.get_dword(vtable_reference + 4)):
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference); continue
 
-            if is_64bit:
-                vtables.append([offset, vtable_reference + 8])
-            else:
-                vtables.append([offset, vtable_reference + 4])
-            
+            vtables.append([offset, vtable_reference + (8 if _IS64 else 4)])
             vtable_reference = ida_xref.get_next_dref_to(typeinfo, vtable_reference)
 
     return vtables
@@ -2451,10 +2078,7 @@ def find_vtables_typeinfo(typeinfo):
 # --------------------
 
 def find_typeinfo_vtable():
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-
-    if filetype == ida_ida.f_PE: # PE
+    if _FILETYPE == ida_ida.f_PE:
         min_address = ida_ida.inf_get_min_ea()
         while True:
             address = find_pattern('2E 3F 41 56 74 79 70 65 5F 69 6E 66 6F 40 40 00', min_address=min_address) # .?AVtype_info@@
@@ -2463,26 +2087,20 @@ def find_typeinfo_vtable():
 
             min_address = address + 16
 
-            if is_64bit:
+            if _IS64:
                 if not ida_bytes.is_off(ida_bytes.get_flags(address - 16), 0):
                     continue
-
                 typeinfo_vtable_address = ida_bytes.get_qword(address - 16)
-
-                if not ida_bytes.is_qword(ida_bytes.get_flags(address - 8)): # spare == qword
+                if not ida_bytes.is_qword(ida_bytes.get_flags(address - 8)):
                     continue
-
-                spare = ida_bytes.get_qword(address - 8) # spare only for runtime (must be 0)
+                spare = ida_bytes.get_qword(address - 8)
             else:
                 if not ida_bytes.is_off(ida_bytes.get_flags(address - 8), 0):
                     continue
-
                 typeinfo_vtable_address = ida_bytes.get_dword(address - 8)
-
-                if not ida_bytes.is_dword(ida_bytes.get_flags(address - 4)): # spare == dword
+                if not ida_bytes.is_dword(ida_bytes.get_flags(address - 4)):
                     continue
-
-                spare = ida_bytes.get_dword(address - 4) # spare only for runtime (must be 0)
+                spare = ida_bytes.get_dword(address - 4)
 
             if not is_valid_address(typeinfo_vtable_address) or spare != 0:
                 continue
@@ -2492,38 +2110,27 @@ def find_typeinfo_vtable():
 def find_type_descriptions(typeinfo_vtable):
     type_descriptors = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-
-    if filetype == ida_ida.f_PE:
+    if _FILETYPE == ida_ida.f_PE:
         vtable_reference = ida_xref.get_first_dref_to(typeinfo_vtable)
         while is_valid_address(vtable_reference):
             if not ida_bytes.has_xref(ida_bytes.get_flags(vtable_reference)):
                 vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference)
                 continue
 
-            if is_64bit:
-                if not ida_bytes.is_qword(ida_bytes.get_flags(vtable_reference + 8)): # spare == qword
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference)
-                    continue
-
-                spare = ida_bytes.get_qword(vtable_reference + 8) # spare only for runtime (must be 0)
+            if _IS64:
+                if not ida_bytes.is_qword(ida_bytes.get_flags(vtable_reference + 8)):
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference); continue
+                spare = ida_bytes.get_qword(vtable_reference + 8)
             else:
-                if not ida_bytes.is_dword(ida_bytes.get_flags(vtable_reference + 4)): # spare == dword
-                    vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference)
-                    continue
-
-                spare = ida_bytes.get_dword(vtable_reference + 4) # spare only for runtime (must be 0)
+                if not ida_bytes.is_dword(ida_bytes.get_flags(vtable_reference + 4)):
+                    vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference); continue
+                spare = ida_bytes.get_dword(vtable_reference + 4)
 
             if spare != 0:
                 vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference)
                 continue
 
-            if is_64bit:
-                name = ida_bytes.get_strlit_contents(vtable_reference + 16, -1, 0)
-            else:
-                name = ida_bytes.get_strlit_contents(vtable_reference + 8, -1, 0)
-
+            name = ida_bytes.get_strlit_contents(vtable_reference + (16 if _IS64 else 8), -1, 0)
             if not name:
                 vtable_reference = ida_xref.get_next_dref_to(typeinfo_vtable, vtable_reference)
                 continue
@@ -2542,10 +2149,7 @@ def find_type_descriptions(typeinfo_vtable):
     return type_descriptors
 
 def find_base_class_descriptor(type_descriptor):
-    
-    filetype = ida_ida.inf_get_filetype()
-
-    if filetype == ida_ida.f_PE:
+    if _FILETYPE == ida_ida.f_PE:
         type_descriptor_reference = ida_xref.get_first_dref_to(type_descriptor)
         while is_valid_address(type_descriptor_reference):
             if not ida_bytes.has_xref(ida_bytes.get_flags(type_descriptor_reference)):
@@ -2561,19 +2165,25 @@ def find_base_class_descriptor(type_descriptor):
 def find_complete_objects(type_descriptor):
     complete_objects = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-    imagebase = ida_nalt.get_imagebase()
-
-    if filetype == ida_ida.f_PE:
+    if _FILETYPE == ida_ida.f_PE:
         type_descriptor_reference = ida_xref.get_first_dref_to(type_descriptor)
         while is_valid_address(type_descriptor_reference):
-            if not ida_bytes.is_dword(ida_bytes.get_flags(type_descriptor_reference - 0xC)):
+            if not ida_bytes.has_xref(ida_bytes.get_flags(type_descriptor_reference)):
                 type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
                 continue
 
-            signature = ida_bytes.get_dword(type_descriptor_reference - 0xC)
-            if signature != 0 and signature != 1: # COL_SIG_REV0 | COL_SIG_REV1
+            if _IS64:
+                if not ida_bytes.is_dword(ida_bytes.get_flags(type_descriptor_reference - 0xC)):
+                    type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
+                    continue
+                signature = ida_bytes.get_dword(type_descriptor_reference - 0xC)
+            else:
+                if not ida_bytes.is_dword(ida_bytes.get_flags(type_descriptor_reference - 0xC)):
+                    type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
+                    continue
+                signature = ida_bytes.get_dword(type_descriptor_reference - 0xC)
+
+            if signature != 0 and signature != 1:
                 type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
                 continue
 
@@ -2583,52 +2193,37 @@ def find_complete_objects(type_descriptor):
                 type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
                 continue
 
-            if is_64bit:
-                if imagebase + ida_bytes.get_dword(type_descriptor_reference + 0x8) != type_descriptor_reference - 0xC:
+            if _IS64:
+                if _IMGBASE + ida_bytes.get_dword(type_descriptor_reference + 0x8) != type_descriptor_reference - 0xC:
                     type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
                     continue
 
             complete_objects.append([offset, type_descriptor_reference - 0xC])
 
             type_descriptor_reference = ida_xref.get_next_dref_to(type_descriptor, type_descriptor_reference)
-            continue
 
     return complete_objects
 
 def get_bases_from_base_class_descriptor(base_class_descriptor, type_descriptions):
     bases = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-    imagebase = ida_nalt.get_imagebase()
-
-    if filetype == ida_ida.f_PE:
-        if is_64bit:
-            class_hierarchy_descriptor = imagebase + ida_bytes.get_dword(base_class_descriptor + 24)
-        else:
-            class_hierarchy_descriptor = ida_bytes.get_dword(base_class_descriptor + 24)
+    if _FILETYPE == ida_ida.f_PE:
+        class_hierarchy_descriptor = (_IMGBASE + ida_bytes.get_dword(base_class_descriptor + 24)) if _IS64 \
+                                     else ida_bytes.get_dword(base_class_descriptor + 24)
 
         signature = ida_bytes.get_dword(class_hierarchy_descriptor)
         if signature != 0 and signature != 1:
             return bases
 
         number_of_bases = ida_bytes.get_dword(class_hierarchy_descriptor + 8)
-
-        if is_64bit:
-            array_of_bases = imagebase + ida_bytes.get_dword(class_hierarchy_descriptor + 12)
-        else:
-            array_of_bases = ida_bytes.get_dword(class_hierarchy_descriptor + 12)
+        array_of_bases  = (_IMGBASE + ida_bytes.get_dword(class_hierarchy_descriptor + 12)) if _IS64 \
+                          else ida_bytes.get_dword(class_hierarchy_descriptor + 12)
 
         for i in range(number_of_bases):
-            if is_64bit:
-                based_class_descriptor = imagebase + ida_bytes.get_dword(array_of_bases + 4 * i)
-            else:
-                based_class_descriptor = ida_bytes.get_dword(array_of_bases + 4 * i)
-
-            if is_64bit:
-                based_class_descriptor_type_descriptor = imagebase + ida_bytes.get_dword(based_class_descriptor)
-            else:
-                based_class_descriptor_type_descriptor = ida_bytes.get_dword(based_class_descriptor)
+            based_class_descriptor = (_IMGBASE + ida_bytes.get_dword(array_of_bases + 4 * i)) if _IS64 \
+                                     else ida_bytes.get_dword(array_of_bases + 4 * i)
+            based_class_descriptor_type_descriptor = (_IMGBASE + ida_bytes.get_dword(based_class_descriptor)) if _IS64 \
+                                                     else ida_bytes.get_dword(based_class_descriptor)
 
             if based_class_descriptor == base_class_descriptor:
                 continue
@@ -2642,39 +2237,25 @@ def get_bases_from_base_class_descriptor(base_class_descriptor, type_description
 def get_bases_from_complete_object(complete_object, type_descriptions):
     bases = []
 
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-    imagebase = ida_nalt.get_imagebase()
-
-    if filetype == ida_ida.f_PE:
-        if is_64bit:
-            complete_object_type_descriptor = imagebase + ida_bytes.get_dword(complete_object + 12)
-            class_hierarchy_descriptor = imagebase + ida_bytes.get_dword(complete_object + 16)
-        else:
-            complete_object_type_descriptor = ida_bytes.get_dword(complete_object + 12)
-            class_hierarchy_descriptor = ida_bytes.get_dword(complete_object + 16)
+    if _FILETYPE == ida_ida.f_PE:
+        complete_object_type_descriptor = (_IMGBASE + ida_bytes.get_dword(complete_object + 12)) if _IS64 \
+                                          else ida_bytes.get_dword(complete_object + 12)
+        class_hierarchy_descriptor      = (_IMGBASE + ida_bytes.get_dword(complete_object + 16)) if _IS64 \
+                                          else ida_bytes.get_dword(complete_object + 16)
 
         signature = ida_bytes.get_dword(class_hierarchy_descriptor)
         if signature != 0 and signature != 1:
             return bases
 
         number_of_bases = ida_bytes.get_dword(class_hierarchy_descriptor + 8)
-
-        if is_64bit:
-            array_of_bases = imagebase + ida_bytes.get_dword(class_hierarchy_descriptor + 12)
-        else:
-            array_of_bases = ida_bytes.get_dword(class_hierarchy_descriptor + 12)
+        array_of_bases  = (_IMGBASE + ida_bytes.get_dword(class_hierarchy_descriptor + 12)) if _IS64 \
+                          else ida_bytes.get_dword(class_hierarchy_descriptor + 12)
 
         for i in range(number_of_bases):
-            if is_64bit:
-                based_class_descriptor = imagebase + ida_bytes.get_dword(array_of_bases + 4 * i)
-            else:
-                based_class_descriptor = ida_bytes.get_dword(array_of_bases + 4 * i)
-
-            if is_64bit:
-                based_class_descriptor_type_descriptor = imagebase + ida_bytes.get_dword(based_class_descriptor)
-            else:
-                based_class_descriptor_type_descriptor = ida_bytes.get_dword(based_class_descriptor)
+            based_class_descriptor = (_IMGBASE + ida_bytes.get_dword(array_of_bases + 4 * i)) if _IS64 \
+                                     else ida_bytes.get_dword(array_of_bases + 4 * i)
+            based_class_descriptor_type_descriptor = (_IMGBASE + ida_bytes.get_dword(based_class_descriptor)) if _IS64 \
+                                                     else ida_bytes.get_dword(based_class_descriptor)
 
             if based_class_descriptor_type_descriptor == complete_object_type_descriptor:
                 continue
@@ -2695,8 +2276,6 @@ def get_type_bases_tree(type_descriptor_address, type_descriptions, visited=None
         return None
     visited.add(type_descriptor_address)
 
-    imagebase = ida_nalt.get_imagebase()
-    is_64bit = ida_ida.inf_is_64bit()
     bases = []
     name = None
 
@@ -2720,10 +2299,8 @@ def get_type_bases_tree(type_descriptor_address, type_descriptions, visited=None
         base_list = get_bases_from_complete_object(col, type_descriptions)
 
         for base_class_descriptor, _ in base_list:
-            if is_64bit:
-                base_type_descriptor = imagebase + ida_bytes.get_dword(base_class_descriptor)
-            else:
-                base_type_descriptor = ida_bytes.get_dword(base_class_descriptor)
+            base_type_descriptor = (_IMGBASE + ida_bytes.get_dword(base_class_descriptor)) if _IS64 \
+                                   else ida_bytes.get_dword(base_class_descriptor)
 
             if (not base_type_descriptor or 
                 base_type_descriptor == type_descriptor_address or
@@ -2742,30 +2319,21 @@ def get_type_bases_tree(type_descriptor_address, type_descriptions, visited=None
     return [type_descriptor_address, name, bases]
 
 def find_complete_object_vtable(complete_object):
-    
-    filetype = ida_ida.inf_get_filetype()
-    is_64bit = ida_ida.inf_is_64bit()
-
-    if filetype == ida_ida.f_PE: # PE
+    if _FILETYPE == ida_ida.f_PE:
         vtable_reference = ida_xref.get_first_dref_to(complete_object)
         while is_valid_address(vtable_reference):
-            if is_64bit:
+            if _IS64:
                 if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference + 8), 0):
-                    vtable_reference = ida_xref.get_next_dref_to(complete_object, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(complete_object, vtable_reference); continue
             else:
                 if not ida_bytes.is_off(ida_bytes.get_flags(vtable_reference + 4), 0):
-                    vtable_reference = ida_xref.get_next_dref_to(complete_object, vtable_reference)
-                    continue
+                    vtable_reference = ida_xref.get_next_dref_to(complete_object, vtable_reference); continue
 
-            if is_64bit:
-                return vtable_reference + 8
-            else:
-                return vtable_reference + 4
+            return vtable_reference + (8 if _IS64 else 4)
 
-# --------------------
+################################################################################
 # Plugin
-# --------------------
+################################################################################
 
 class vdump_t(ida_idaapi.plugin_t):
     flags = ida_idaapi.PLUGIN_MOD
@@ -2782,6 +2350,11 @@ class vdump_t(ida_idaapi.plugin_t):
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg = None):
+        global _FILETYPE, _IS64, _IMGBASE
+        _FILETYPE = ida_ida.inf_get_filetype()
+        _IS64     = ida_ida.inf_is_64bit()
+        _IMGBASE  = ida_nalt.get_imagebase()
+
         if not ida_auto.auto_is_ok():
             print_message('INFO: The analysis is not finished!')
             return
@@ -2790,16 +2363,14 @@ class vdump_t(ida_idaapi.plugin_t):
             print_message('ERROR: Failed to initialize hexrays plugin!\n')
             return
 
-        filetype = ida_ida.inf_get_filetype()
-        if filetype != ida_ida.f_PE and filetype != ida_ida.f_ELF and filetype != ida_ida.f_MACHO:
+        if _FILETYPE not in (ida_ida.f_PE, ida_ida.f_ELF, ida_ida.f_MACHO):
             print_message('ERROR: This file type is not supported!\n')
             return
 
-        filetype = ida_ida.inf_get_filetype()
         trees = []
         class_vfuncs = {}
 
-        if filetype in (ida_ida.f_ELF, ida_ida.f_MACHO):
+        if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
             type_infos = find_type_infos()
             for address, name in type_infos:
                 name = format_name(name)
@@ -2813,7 +2384,7 @@ class vdump_t(ida_idaapi.plugin_t):
                             class_vfuncs[name] = {}
                         class_vfuncs[name][offset] = vfuncs
 
-        elif filetype == ida_ida.f_PE:
+        elif _FILETYPE == ida_ida.f_PE:
             typeinfo_vtable = find_typeinfo_vtable()
             if typeinfo_vtable is None:
                 print_message('ERROR: Failed to find typeinfo vtable for PE')
@@ -2858,6 +2429,237 @@ class vdump_t(ida_idaapi.plugin_t):
         print_message(f'NOTE: C++ VTable declarations written to {output_h_path}')
 
         if DUMP_FOR_SOURCE_PYTHON:
+            # PythonEmitter still uses converter API; reuse type cache implicitly
+            class PythonEmitter:
+                def __init__(self, conv):
+                    self.conv = conv
+                    self.used_func_names = {}
+
+                def _normalize_name(self, cls, offset, base, idx):
+                    bn = (base or '').strip()
+                    if bn.startswith('~') or '::~' in bn:
+                        name = 'destructor'
+                        key = (cls, offset, name)
+                        self.used_func_names.setdefault(key, 0)
+                        self.used_func_names[key] += 1
+                        return name
+
+                    name = (bn or '').strip()
+                    if name.startswith('operator'):
+                        name = f'operator_{idx:010}'
+                    name = re.sub(r'[^0-9A-Za-z_]', '_', name)
+                    name = re.sub(r'__+', '_', name).strip('_')
+                    if not name:
+                        name = f'Method_{idx:010}'
+
+                    key = (cls, offset, name)
+                    self.used_func_names.setdefault(key, 0)
+                    self.used_func_names[key] += 1
+                    if self.used_func_names[key] > 1:
+                        name = f'{name}_{self.used_func_names[key]}'
+                    return name
+
+                def _is_pure_or_destructor(self, demangled):
+                    d = _sanitize_demangled(demangled)
+                    if d.startswith('~') or '::~' in d or 'destructor' in d:
+                        return 'destructor'
+                    if d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
+                        return 'pure'
+                    return None
+
+                def generate(self, class_vfuncs):
+                    lines = []
+                    lines.append('from memory import DataType, Convention')
+                    lines.append('from memory import manager, CustomType')
+                    lines.append('')
+                    lines.append('')
+
+                    indegree = dict(self.conv.in_degree)
+                    queue = collections.deque([cls for cls, deg in indegree.items() if deg == 0])
+                    sorted_classes = []
+                    while queue:
+                        cls = queue.popleft()
+                        sorted_classes.append(cls)
+                        for derived in self.conv.reverse_graph.get(cls, []):
+                            indegree[derived] -= 1
+                            if indegree[derived] == 0:
+                                queue.append(derived)
+
+                    for cls in sorted_classes:
+                        if cls not in class_vfuncs:
+                            continue
+
+                        other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
+
+                        for offset, vfuncs in class_vfuncs[cls].items():
+                            py_cls_name = f'{cls}_{offset:08X}'
+                            lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
+
+                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
+                            if not filtered:
+                                lines.append('    pass')
+                                lines.append('')
+                            else:
+                                for logical_idx, phys_idx, func_ea, demangled in filtered:
+                                    if not demangled:
+                                        continue
+
+                                    special = self._is_pure_or_destructor(demangled)
+                                    if special == 'destructor':
+                                        lines.append(
+                                            f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                        )
+                                        continue
+                                    if special == 'pure':
+                                        lines.append(
+                                            f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                        )
+                                        continue
+
+                                    sig = SIGCACHE.get(func_ea, demangled)
+                                    base = sig["base"]
+                                    method_name = self._normalize_name(cls, offset, base, logical_idx)
+                                    ret_dt = 'DataType.VOID'
+                                    # map conv.simplify result to enum approx via tinfo
+                                    # re-derive from prototype if available, otherwise pointer/void
+                                    tinfo = None
+                                    try:
+                                        decomp = ida_hexrays.decompile(func_ea)
+                                    except Exception:
+                                        decomp = None
+                                    if decomp:
+                                        tinfo = decomp.type
+                                    else:
+                                        f = ida_funcs.get_func(func_ea)
+                                        if f and f.prototype:
+                                            tinfo = f.prototype
+
+                                    def _dt_from_tinfo_arg(a):
+                                        try:
+                                            if a.is_ref():
+                                                b = ida_typeinf.tinfo_t(a)
+                                                b.remove_ref()
+                                                a = b
+                                            if a.is_array() or a.is_ptr():
+                                                # strings / pointers
+                                                try:
+                                                    if a.is_ptr():
+                                                        pt = a.get_pointed_object()
+                                                        if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
+                                                            return 'DataType.STRING'
+                                                except Exception:
+                                                    pass
+                                                return 'DataType.POINTER'
+                                            if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
+                                            if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
+                                            if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
+                                            if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
+                                            if a.is_integral() or a.is_arithmetic():
+                                                sz = a.get_size()
+                                                sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
+                                                if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
+                                                if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
+                                                if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
+                                                if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
+                                                return 'DataType.POINTER'
+                                        except Exception:
+                                            return 'DataType.POINTER'
+                                        return 'DataType.POINTER'
+
+                                    arg_dts = []
+                                    if tinfo and tinfo.is_func():
+                                        try:
+                                            r = tinfo.get_rettype()
+                                            if r: ret_dt = _dt_from_tinfo_arg(r)
+                                        except Exception:
+                                            ret_dt = 'DataType.VOID'
+                                        try:
+                                            for i in range(1, tinfo.get_nargs()):
+                                                arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
+                                        except Exception:
+                                            arg_dts = []
+                                    else:
+                                        # fallback: demangled-based args as POINTERs
+                                        arg_dts = ['DataType.POINTER' for _ in sig['args']]
+
+                                    args_repr = ', '.join(arg_dts)
+                                    lines.append(
+                                        f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
+                                    )
+                                lines.append('')
+
+                            self.used_func_names = {}
+
+                            full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+                            need_full = self.conv._need_full_class(filtered, full_list)
+                            if not need_full:
+                                continue
+
+                            py_cls_name_full = f'{cls}_Full_{offset:08X}'
+                            lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
+
+                            if not full_list:
+                                lines.append('    pass')
+                                lines.append('')
+                                continue
+
+                            for logical_idx, phys_idx, func_ea, demangled in full_list:
+                                if not demangled:
+                                    continue
+                                special = self._is_pure_or_destructor(demangled)
+                                if special == 'destructor':
+                                    lines.append(
+                                        f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                    )
+                                    continue
+                                if special == 'pure':
+                                    lines.append(
+                                        f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                    )
+                                    continue
+
+                                sig = SIGCACHE.get(func_ea, demangled)
+                                base = sig['base']
+                                method_name = self._normalize_name(cls, offset, base, logical_idx)
+
+                                # reuse same derivation as above
+                                ret_dt = 'DataType.VOID'
+                                tinfo = None
+                                try:
+                                    decomp = ida_hexrays.decompile(func_ea)
+                                except Exception:
+                                    decomp = None
+                                if decomp:
+                                    tinfo = decomp.type
+                                else:
+                                    f = ida_funcs.get_func(func_ea)
+                                    if f and f.prototype:
+                                        tinfo = f.prototype
+
+                                arg_dts = []
+                                if tinfo and tinfo.is_func():
+                                    try:
+                                        r = tinfo.get_rettype()
+                                        if r: ret_dt = _dt_from_tinfo_arg(r)
+                                    except Exception:
+                                        ret_dt = 'DataType.VOID'
+                                    try:
+                                        for i in range(1, tinfo.get_nargs()):
+                                            arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
+                                    except Exception:
+                                        arg_dts = []
+                                else:
+                                    arg_dts = ['DataType.POINTER' for _ in sig['args']]
+
+                                args_repr = ', '.join(arg_dts)
+                                lines.append(
+                                    f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
+                                )
+
+                            lines.append('')
+
+                    return '\n'.join(lines)
+
             py_emitter = PythonEmitter(converter)
             output_py = py_emitter.generate(class_vfuncs)
             output_py_path = idb_path.with_suffix('.py')
