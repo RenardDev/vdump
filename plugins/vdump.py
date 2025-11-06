@@ -1,4 +1,3 @@
-
 # Author: RenardDev (zeze839@gmail.com)
 
 # --------------------
@@ -134,7 +133,6 @@ def _parse_type_cached(s: str):
     tif = ida_typeinf.tinfo_t()
     if ida_typeinf.parse_decl(tif, None, s, ida_typeinf.PT_SIL | ida_typeinf.PT_TYP | ida_typeinf.PT_SEMICOLON) is None:
         return None
-    # keep outer-most pointer if there are several, for stability with .is_ptr() checks
     if tif.is_ptr():
         t = tif
         lt = tif
@@ -1579,10 +1577,6 @@ class DeclarationConverter:
     # ---------- Full class need check ----------
 
     def _need_full_class(self, filtered, full_list) -> bool:
-        """
-        True, если набор виртуальных функций (по очищенным деманглам и порядку)
-        отличается между filtered и полным списком.
-        """
         f1 = [ _sanitize_demangled(d) for _, _, _, d in filtered if d ]
         f2 = [ _sanitize_demangled(d) for _, _, ea, d in full_list if d ]
         return f1 != f2
@@ -1707,7 +1701,6 @@ class DeclarationConverter:
         func_name = f'{name_prefix}{func_name}'
         func_name = self._next_unique_name(cls, offset, func_name)
 
-        # Expand INVOKE template with concrete name
         invoke = self._emit_static_invoke(idx_logical, ret_str, args).replace('INVOKE', func_name)
         return invoke
 
@@ -1783,17 +1776,18 @@ class DeclarationConverter:
 
             other_counts = self._collect_key_counts_from_nonzero_offsets(cls)
 
+            std_decls_for_cls = []
+            full_decls_for_cls = []
+
             for offset in self.class_vfuncs[cls]:
                 offset_name       = f'{cls}_{offset:08X}'
                 offset_name_full  = f'{cls}_Full_{offset:08X}'
                 class_name_map[(cls, offset)] = offset_name
 
-                # forward-decl: базовый всегда
                 self.forward_decls.add(f'class {offset_name}; // OFFSET: {offset:08X}')
 
                 vfuncs = self.class_vfuncs[cls][offset]
 
-                # ------ filtered (stable logical indices across all sections) ------
                 filtered = self._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
 
                 decl_lines = [
@@ -1826,17 +1820,15 @@ class DeclarationConverter:
                     decl_lines.append(f'    {decl}')
 
                 decl_lines.append('};')
-                class_declarations.append('\n'.join(decl_lines))
 
-                # сброс уникальных имён перед проверкой Full
+                std_decls_for_cls.append('\n'.join(decl_lines))
+
                 self.used_func_names[(cls, offset)] = {}
 
-                # ------ full (no filtering; keep destructor de-dup behavior) ------
                 full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
                 need_full = self._need_full_class(filtered, full_list)
 
                 if need_full:
-                    # forward-decl только если отличается
                     self.forward_decls.add(f'class {offset_name_full}; // OFFSET: {offset:08X}')
 
                     decl_lines_full = [
@@ -1869,7 +1861,11 @@ class DeclarationConverter:
                         decl_lines_full.append(f'    {decl}')
 
                     decl_lines_full.append('};')
-                    class_declarations.append('\n'.join(decl_lines_full))
+
+                    full_decls_for_cls.append('\n'.join(decl_lines_full))
+
+            class_declarations.extend(std_decls_for_cls)
+            class_declarations.extend(full_decls_for_cls)
 
         for cls in self.declare:
             if cls not in sorted_classes:
@@ -1893,7 +1889,6 @@ def get_vtable_functions(vtable):
         ___cxa_pure_virtual = ida_name.get_name_ea(0, '___cxa_pure_virtual')
 
     while True:
-        # is entry a valid offset?
         if _IS64:
             if not ida_bytes.is_off(ida_bytes.get_flags(vtable + 8 * i), 0):
                 break
@@ -1903,7 +1898,6 @@ def get_vtable_functions(vtable):
                 break
             func = ida_bytes.get_dword(vtable + 4 * i)
 
-        # validity of target
         if not ida_funcs.get_func(func):
             if _FILETYPE in (ida_ida.f_ELF, ida_ida.f_MACHO):
                 if func != ___cxa_pure_virtual:
@@ -2429,7 +2423,6 @@ class vdump_t(ida_idaapi.plugin_t):
         print_message(f'NOTE: C++ VTable declarations written to {output_h_path}')
 
         if DUMP_FOR_SOURCE_PYTHON:
-            # PythonEmitter still uses converter API; reuse type cache implicitly
             class PythonEmitter:
                 def __init__(self, conv):
                     self.conv = conv
@@ -2491,121 +2484,22 @@ class vdump_t(ida_idaapi.plugin_t):
 
                         other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
 
-                        for offset, vfuncs in class_vfuncs[cls].items():
+                        offsets_sorted = sorted(class_vfuncs[cls].items(), key=lambda kv: kv[0])
+
+                        for offset, vfuncs in offsets_sorted:
                             py_cls_name = f'{cls}_{offset:08X}'
                             lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
 
-                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
+                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts.copy())
                             if not filtered:
                                 lines.append('    pass')
                                 lines.append('')
-                            else:
-                                for logical_idx, phys_idx, func_ea, demangled in filtered:
-                                    if not demangled:
-                                        continue
-
-                                    special = self._is_pure_or_destructor(demangled)
-                                    if special == 'destructor':
-                                        lines.append(
-                                            f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                        )
-                                        continue
-                                    if special == 'pure':
-                                        lines.append(
-                                            f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                        )
-                                        continue
-
-                                    sig = SIGCACHE.get(func_ea, demangled)
-                                    base = sig["base"]
-                                    method_name = self._normalize_name(cls, offset, base, logical_idx)
-                                    ret_dt = 'DataType.VOID'
-                                    # map conv.simplify result to enum approx via tinfo
-                                    # re-derive from prototype if available, otherwise pointer/void
-                                    tinfo = None
-                                    try:
-                                        decomp = ida_hexrays.decompile(func_ea)
-                                    except Exception:
-                                        decomp = None
-                                    if decomp:
-                                        tinfo = decomp.type
-                                    else:
-                                        f = ida_funcs.get_func(func_ea)
-                                        if f and f.prototype:
-                                            tinfo = f.prototype
-
-                                    def _dt_from_tinfo_arg(a):
-                                        try:
-                                            if a.is_ref():
-                                                b = ida_typeinf.tinfo_t(a)
-                                                b.remove_ref()
-                                                a = b
-                                            if a.is_array() or a.is_ptr():
-                                                # strings / pointers
-                                                try:
-                                                    if a.is_ptr():
-                                                        pt = a.get_pointed_object()
-                                                        if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
-                                                            return 'DataType.STRING'
-                                                except Exception:
-                                                    pass
-                                                return 'DataType.POINTER'
-                                            if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
-                                            if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
-                                            if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
-                                            if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
-                                            if a.is_integral() or a.is_arithmetic():
-                                                sz = a.get_size()
-                                                sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
-                                                if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
-                                                if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
-                                                if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
-                                                if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
-                                                return 'DataType.POINTER'
-                                        except Exception:
-                                            return 'DataType.POINTER'
-                                        return 'DataType.POINTER'
-
-                                    arg_dts = []
-                                    if tinfo and tinfo.is_func():
-                                        try:
-                                            r = tinfo.get_rettype()
-                                            if r: ret_dt = _dt_from_tinfo_arg(r)
-                                        except Exception:
-                                            ret_dt = 'DataType.VOID'
-                                        try:
-                                            for i in range(1, tinfo.get_nargs()):
-                                                arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
-                                        except Exception:
-                                            arg_dts = []
-                                    else:
-                                        # fallback: demangled-based args as POINTERs
-                                        arg_dts = ['DataType.POINTER' for _ in sig['args']]
-
-                                    args_repr = ', '.join(arg_dts)
-                                    lines.append(
-                                        f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
-                                    )
-                                lines.append('')
-
-                            self.used_func_names = {}
-
-                            full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
-                            need_full = self.conv._need_full_class(filtered, full_list)
-                            if not need_full:
                                 continue
 
-                            py_cls_name_full = f'{cls}_Full_{offset:08X}'
-                            lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
-
-                            if not full_list:
-                                lines.append('    pass')
-                                lines.append('')
-                                continue
-
-                            for logical_idx, phys_idx, func_ea, demangled in full_list:
+                            for logical_idx, phys_idx, func_ea, demangled in filtered:
                                 if not demangled:
                                     continue
+
                                 special = self._is_pure_or_destructor(demangled)
                                 if special == 'destructor':
                                     lines.append(
@@ -2619,10 +2513,9 @@ class vdump_t(ida_idaapi.plugin_t):
                                     continue
 
                                 sig = SIGCACHE.get(func_ea, demangled)
-                                base = sig['base']
+                                base = sig["base"]
                                 method_name = self._normalize_name(cls, offset, base, logical_idx)
 
-                                # reuse same derivation as above
                                 ret_dt = 'DataType.VOID'
                                 tinfo = None
                                 try:
@@ -2635,6 +2528,35 @@ class vdump_t(ida_idaapi.plugin_t):
                                     f = ida_funcs.get_func(func_ea)
                                     if f and f.prototype:
                                         tinfo = f.prototype
+
+                                def _dt_from_tinfo_arg(a):
+                                    try:
+                                        if a.is_ref():
+                                            b = ida_typeinf.tinfo_t(a); b.remove_ref(); a = b
+                                        if a.is_array() or a.is_ptr():
+                                            try:
+                                                if a.is_ptr():
+                                                    pt = a.get_pointed_object()
+                                                    if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
+                                                        return 'DataType.STRING'
+                                            except Exception:
+                                                pass
+                                            return 'DataType.POINTER'
+                                        if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
+                                        if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
+                                        if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
+                                        if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
+                                        if a.is_integral() or a.is_arithmetic():
+                                            sz = a.get_size()
+                                            sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
+                                            if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
+                                            if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
+                                            if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
+                                            if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
+                                            return 'DataType.POINTER'
+                                    except Exception:
+                                        return 'DataType.POINTER'
+                                    return 'DataType.POINTER'
 
                                 arg_dts = []
                                 if tinfo and tinfo.is_func():
@@ -2657,6 +2579,109 @@ class vdump_t(ida_idaapi.plugin_t):
                                 )
 
                             lines.append('')
+
+                        self.used_func_names = {}
+
+                        for offset, vfuncs in offsets_sorted:
+                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts.copy())
+                            full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+                            need_full = self.conv._need_full_class(filtered, full_list)
+                            if not need_full:
+                                continue
+
+                            py_cls_name_full = f'{cls}_Full_{offset:08X}'
+                            lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
+
+                            if not full_list:
+                                lines.append('    pass')
+                                lines.append('')
+                                continue
+
+                            for logical_idx, phys_idx, func_ea, demangled in full_list:
+                                if not demangled:
+                                    continue
+
+                                special = self._is_pure_or_destructor(demangled)
+                                if special == 'destructor':
+                                    lines.append(
+                                        f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                    )
+                                    continue
+                                if special == 'pure':
+                                    lines.append(
+                                        f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                    )
+                                    continue
+
+                                sig = SIGCACHE.get(func_ea, demangled)
+                                base = sig['base']
+                                method_name = self._normalize_name(cls, offset, base, logical_idx)
+
+                                ret_dt = 'DataType.VOID'
+                                tinfo = None
+                                try:
+                                    decomp = ida_hexrays.decompile(func_ea)
+                                except Exception:
+                                    decomp = None
+                                if decomp:
+                                    tinfo = decomp.type
+                                else:
+                                    f = ida_funcs.get_func(func_ea)
+                                    if f and f.prototype:
+                                        tinfo = f.prototype
+
+                                def _dt_from_tinfo_arg(a):
+                                    try:
+                                        if a.is_ref():
+                                            b = ida_typeinf.tinfo_t(a); b.remove_ref(); a = b
+                                        if a.is_array() or a.is_ptr():
+                                            try:
+                                                if a.is_ptr():
+                                                    pt = a.get_pointed_object()
+                                                    if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
+                                                        return 'DataType.STRING'
+                                            except Exception:
+                                                pass
+                                            return 'DataType.POINTER'
+                                        if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
+                                        if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
+                                        if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
+                                        if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
+                                        if a.is_integral() or a.is_arithmetic():
+                                            sz = a.get_size()
+                                            sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
+                                            if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
+                                            if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
+                                            if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
+                                            if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
+                                            return 'DataType.POINTER'
+                                    except Exception:
+                                        return 'DataType.POINTER'
+                                    return 'DataType.POINTER'
+
+                                arg_dts = []
+                                if tinfo and tinfo.is_func():
+                                    try:
+                                        r = tinfo.get_rettype()
+                                        if r: ret_dt = _dt_from_tinfo_arg(r)
+                                    except Exception:
+                                        ret_dt = 'DataType.VOID'
+                                    try:
+                                        for i in range(1, tinfo.get_nargs()):
+                                            arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
+                                    except Exception:
+                                        arg_dts = []
+                                else:
+                                    arg_dts = ['DataType.POINTER' for _ in sig['args']]
+
+                                args_repr = ', '.join(arg_dts)
+                                lines.append(
+                                    f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
+                                )
+
+                            lines.append('')
+
+                        self.used_func_names = {}
 
                     return '\n'.join(lines)
 
