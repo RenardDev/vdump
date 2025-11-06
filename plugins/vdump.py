@@ -1486,17 +1486,20 @@ class DeclarationConverter:
             other_counts = self._collect_key_counts_from_nonzero_offsets(cls)
 
             for offset in self.class_vfuncs[cls]:
-                offset_name = f'{cls}_{offset:08X}'
+                offset_name       = f'{cls}_{offset:08X}'
+                offset_name_full  = f'{cls}_Full_{offset:08X}'
                 class_name_map[(cls, offset)] = offset_name
 
                 self.forward_decls.add(f'class {offset_name}; // OFFSET: {offset:08X}')
+                self.forward_decls.add(f'class {offset_name_full}; // OFFSET: {offset:08X}')
+
+                vfuncs = self.class_vfuncs[cls][offset]
 
                 decl_lines = [
                     f'class {offset_name} {{ // OFFSET: {offset:08X}',
                     'public:'
                 ]
 
-                vfuncs = self.class_vfuncs[cls][offset]
                 filtered = self._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
 
                 for log_i, phys_i, func, demangled in filtered:
@@ -1523,11 +1526,44 @@ class DeclarationConverter:
                     decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset)
                     decl_lines.append(f'    {decl}')
 
-                decl_lines.extend([
-                    '};'
-                ])
-
+                decl_lines.append('};')
                 class_declarations.append('\n'.join(decl_lines))
+
+                self.used_func_names[(cls, offset)] = {}
+
+                decl_lines_full = [
+                    f'class {offset_name_full} {{ // OFFSET: {offset:08X}',
+                    'public:'
+                ]
+
+                full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+
+                for log_i, phys_i, func, demangled in full_list:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_function(log_i, func, d2, cls, offset)
+                    decl_lines_full.append(f'    // {log_i:>10} - {d2}')
+                    decl_lines_full.append(f'    {decl}\n')
+
+                for log_i, phys_i, func, demangled in full_list:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_static_function(log_i, phys_i, func, d2, cls, offset)
+                    decl_lines_full.append(f'    {decl}')
+
+                decl_lines_full.append('')
+
+                for log_i, phys_i, func, demangled in full_list:
+                    if not demangled:
+                        continue
+                    d2 = demangled.replace('`non-virtual thunk to\'', '')
+                    decl = self.process_get_function(log_i, phys_i, func, d2, cls, offset)
+                    decl_lines_full.append(f'    {decl}')
+
+                decl_lines_full.append('};')
+                class_declarations.append('\n'.join(decl_lines_full))
 
         for cls in self.declare:
             if cls not in sorted_classes:
@@ -2092,33 +2128,71 @@ if DUMP_FOR_SOURCE_PYTHON:
             lines.append('')
             lines.append('')
 
-            queue = collections.deque([cls for cls, deg in self.conv.in_degree.items() if deg == 0])
+            indegree = dict(self.conv.in_degree)
+            queue = collections.deque([cls for cls, deg in indegree.items() if deg == 0])
             sorted_classes = []
             while queue:
                 cls = queue.popleft()
                 sorted_classes.append(cls)
                 for derived in self.conv.reverse_graph.get(cls, []):
-                    self.conv.in_degree[derived] -= 1
-                    if self.conv.in_degree[derived] == 0:
+                    indegree[derived] -= 1
+                    if indegree[derived] == 0:
                         queue.append(derived)
 
             for cls in sorted_classes:
                 if cls not in class_vfuncs:
                     continue
 
+                other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
+
                 for offset, vfuncs in class_vfuncs[cls].items():
                     py_cls_name = f'{cls}_{offset:08X}'
                     lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
 
-                    other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
                     filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts)
 
                     if not filtered:
                         lines.append('    pass')
                         lines.append('')
+                    else:
+                        for logical_idx, phys_idx, func_ea, demangled in filtered:
+                            if not demangled:
+                                continue
+                            base = demangled.split('(')[0].split('::')[-1]
+
+                            special = self._is_pure_or_destructor(demangled)
+                            if special == 'destructor':
+                                lines.append(
+                                    f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                )
+                                continue
+                            if special == 'pure':
+                                lines.append(
+                                    f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
+                                )
+                                continue
+
+                            method_name = self._normalize_name(cls, offset, base, logical_idx)
+                            ret_dt, arg_dts, conv_str = self._extract_signature_datatypes(func_ea, demangled)
+                            args_repr = ', '.join(arg_dts)
+                            lines.append(
+                                f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, {conv_str})'
+                            )
+                        lines.append('')
+
+                    self.used_func_names = {}
+
+                    py_cls_name_full = f'{cls}_Full_{offset:08X}'
+                    lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
+
+                    full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
+
+                    if not full_list:
+                        lines.append('    pass')
+                        lines.append('')
                         continue
 
-                    for logical_idx, phys_idx, func_ea, demangled in filtered:
+                    for logical_idx, phys_idx, func_ea, demangled in full_list:
                         if not demangled:
                             continue
                         base = demangled.split('(')[0].split('::')[-1]
@@ -2143,6 +2217,7 @@ if DUMP_FOR_SOURCE_PYTHON:
                         )
 
                     lines.append('')
+
             return '\n'.join(lines)
 
 def get_vtable_functions(vtable):
