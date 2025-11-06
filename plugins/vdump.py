@@ -50,7 +50,7 @@ import ida_idc
 import ida_typeinf
 import ida_loader
 
-VDUMP_VERSION = '4.0.0'
+VDUMP_VERSION = '4.0.1'
 DUMP_FOR_SOURCE_PYTHON = False
 
 ################################################################################
