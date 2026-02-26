@@ -50,7 +50,7 @@ import ida_idc
 import ida_typeinf
 import ida_loader
 
-VDUMP_VERSION = '4.0.1'
+VDUMP_VERSION = '4.0.2'
 DUMP_FOR_SOURCE_PYTHON = False
 
 ################################################################################
@@ -2463,7 +2463,7 @@ class vdump_t(ida_idaapi.plugin_t):
                 def generate(self, class_vfuncs):
                     lines = []
                     lines.append('from memory import DataType, Convention')
-                    lines.append('from memory import manager, CustomType')
+                    lines.append('from memory.manager import manager, CustomType')
                     lines.append('')
                     lines.append('')
 
