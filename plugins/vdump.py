@@ -50,8 +50,7 @@ import ida_idc
 import ida_typeinf
 import ida_loader
 
-VDUMP_VERSION = '4.0.2'
-DUMP_FOR_SOURCE_PYTHON = False
+VDUMP_VERSION = '4.5.0'
 
 ################################################################################
 # Base functions
@@ -1332,7 +1331,7 @@ def extract_object_name(decl_str):
 
 class SignatureCache:
     def __init__(self, converter_ref=None):
-        self.sig = {}  # ea -> dict(ret_str, args, base, special)
+        self.sig = {}  # ea -> dict(args, base, special)
         self.conv = converter_ref  # filled later
 
     def attach(self, conv):
@@ -1366,46 +1365,39 @@ class SignatureCache:
         d = _sanitize_demangled(demangled)
         base_name = d.split('(')[0].split('::')[-1]
 
-        # Try to get type info (prefer decompile)
-        ret_str = 'void'
-        decomp_t = None
-        try:
-            decomp = ida_hexrays.decompile(ea)
-        except Exception:
-            decomp = None
-        if decomp:
-            decomp_t = decomp.type
-            rt = decomp_t.get_rettype()
-            rt.clr_decl_const_volatile()
-            ret_str = self.conv.simplify_type(rt)
-        else:
-            f = ida_funcs.get_func(ea)
-            if f and f.prototype:
-                decomp_t = f.prototype
-                rt = decomp_t.get_rettype()
-                rt.clr_decl_const_volatile()
-                ret_str = self.conv.simplify_type(rt)
-
-        # Build args (fallback to decompiled prototype first)
-        args = []
-        if decomp_t and decomp_t.is_func():
-            try:
-                for i in range(1, decomp_t.get_nargs()):
-                    a = decomp_t.get_nth_arg(i)
-                    a.clr_decl_const_volatile()
-                    astr = self.conv.simplify_type(a)
-                    if astr == 'void' and i <= 2:
-                        astr = 'void*'
-                    args.append(astr)
-            except Exception:
-                args = []
-
-        # If demangled signature is parseable, prefer it (canonicalized & cached)
+        # Prefer a parseable demangled signature.  If it is unavailable, use
+        # Hex-Rays type information and then the IDA prototype.  Return types
+        # are intentionally not inferred: generated wrappers default to void
+        # and can override it at the call site.
         fi = extract_function_info(d)
-        if fi:
+        args = []
+        if fi and '(' in d:
             _, dargs = fi
             args = [ self._canon_from_demangled(a) for a in dargs ]
-            # Ret stays from decompiler/prototype (more reliable)
+        else:
+            type_info = None
+            try:
+                decomp = ida_hexrays.decompile(ea)
+            except Exception:
+                decomp = None
+            if decomp:
+                type_info = decomp.type
+            else:
+                f = ida_funcs.get_func(ea)
+                if f and f.prototype:
+                    type_info = f.prototype
+
+            if type_info and type_info.is_func():
+                try:
+                    for i in range(1, type_info.get_nargs()):
+                        a = type_info.get_nth_arg(i)
+                        a.clr_decl_const_volatile()
+                        astr = self.conv.simplify_type(a)
+                        if astr == 'void' and i <= 2:
+                            astr = 'void*'
+                        args.append(astr)
+                except Exception:
+                    args = []
 
         # classify special
         special = None
@@ -1414,7 +1406,7 @@ class SignatureCache:
         elif d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
             special = 'pure'
 
-        self.sig[ea] = dict(ret=ret_str, args=tuple(args), base=base_name, special=special)
+        self.sig[ea] = dict(args=tuple(args), base=base_name, special=special)
         return self.sig[ea]
 
 SIGCACHE = SignatureCache()
@@ -1437,7 +1429,7 @@ class DeclarationConverter:
         self.used_func_names = {}
         self.class_vfuncs = {}
 
-    def convert(self, trees, class_vfuncs):
+    def convert(self, trees, class_vfuncs, separate=False):
         self.reset_state()
         self.class_vfuncs = class_vfuncs
 
@@ -1445,7 +1437,7 @@ class DeclarationConverter:
             if tree is not None:
                 self.process_tree(tree)
 
-        return self.generate_declarations()
+        return self.generate_declarations(separate=separate)
 
     def process_tree(self, root_node):
         stack = [root_node]
@@ -1589,6 +1581,18 @@ class DeclarationConverter:
         count = self.used_func_names[(cls, offset)][func_name]
         return f'{func_name}_{count}' if count > 1 else func_name
 
+    def _template_params(self, args):
+        return 'typename ReturnType = void, typename... Overrides'
+
+    def _template_constraint(self, args):
+        return f'requires vdump::valid_arg_overrides<{len(args)}, Overrides...>'
+
+    def _named_template_args(self, args):
+        return [
+            f'vdump::arg_type_t<{i}, {arg}, Overrides...> a{i}'
+            for i, arg in enumerate(args, start=1)
+        ]
+
     def _emit_virtual_decl(self, idx, ea, demangled, cls, offset, dtor_class_name):
         d = _sanitize_demangled(demangled)
 
@@ -1602,7 +1606,6 @@ class DeclarationConverter:
             return f'virtual void InvalidStub_{idx:010}() = 0;'
 
         sig = SIGCACHE.get(ea, d)
-        ret_str = sig['ret']
         base = sig['base']
         args = list(sig['args'])
 
@@ -1614,23 +1617,50 @@ class DeclarationConverter:
 
         func_name = self._normalize_operator_name(base, idx)
         func_name = self._next_unique_name(cls, offset, func_name)
-        return f'virtual {ret_str} {func_name}({", ".join(args)}) = 0;'
+        named_args = self._named_template_args(args)
+        call_args = ', '.join(f'a{i}' for i in range(1, len(args) + 1))
+        return (
+            f'template <{self._template_params(args)}> '
+            f'ReturnType {func_name}({", ".join(named_args)}) '
+            f'{self._template_constraint(args)} {{ '
+            f'return static_{func_name}<ReturnType, Overrides...>(this, 0'
+            f'{", " + call_args if call_args else ""}); }}'
+        )
 
-    def _emit_static_invoke(self, idx_logical, ret_str, args):
+    def _emit_static_invoke(self, idx_logical, args):
+        """Emit a call-through wrapper with a caller-selected return type.
+
+        A virtual function's ABI does not encode its return type in the vtable
+        slot.  Keeping the return type as a template parameter lets callers
+        choose the type they need while preserving ``void`` as the safe
+        default.  Argument type overrides are selected by 1-based argument
+        index:
+
+            Class::static_Foo<bool>(pThis, 0, arg);
+            Class::static_Foo<void, vdump::arg<2, void*>>(pThis, 0, ptr);
+            Class::static_Foo(pThis, 0, arg);  // ReturnType == void
+        """
+        template = f'template <{self._template_params(args)}> '
         if args:
-            nargs = [f'{arg} a{i}' for i, arg in enumerate(args, start=1)]
+            nargs = self._named_template_args(args)
+            arg_types = ', '.join(
+                f'vdump::arg_type_t<{i}, {arg}, Overrides...>'
+                for i, arg in enumerate(args, start=1)
+            )
             naargs = [f'a{i}' for i in range(1, len(args) + 1)]
             return (
-                f'static {ret_str} INVOKE(void* pThis, int nFixOffset, {", ".join(nargs)}) {{ '
+                f'{template}static ReturnType INVOKE(void* pThis, int nFixOffset, {", ".join(nargs)}) '
+                f'{self._template_constraint(args)} {{ '
                 f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*, {", ".join(args)})>'
+                f'return reinterpret_cast<ReturnType(__thiscall*)(void*, {arg_types})>'
                 f'(pVTable[{idx_logical} + nFixOffset])(pThis, {", ".join(naargs)}); }};'
             )
         else:
             return (
-                f'static {ret_str} INVOKE(void* pThis, int nFixOffset) {{ '
+                f'{template}static ReturnType INVOKE(void* pThis, int nFixOffset) '
+                f'{self._template_constraint(args)} {{ '
                 f'void** pVTable = *reinterpret_cast<void***>(pThis); '
-                f'return reinterpret_cast<{ret_str}(__thiscall*)(void*)>'
+                f'return reinterpret_cast<ReturnType(__thiscall*)(void*)>'
                 f'(pVTable[{idx_logical} + nFixOffset])(pThis); }};'
             )
 
@@ -1659,7 +1689,6 @@ class DeclarationConverter:
             )
 
         sig = SIGCACHE.get(ea, d)
-        ret_str = sig['ret']
         base = sig['base']
         args = list(sig['args'])
 
@@ -1701,7 +1730,7 @@ class DeclarationConverter:
         func_name = f'{name_prefix}{func_name}'
         func_name = self._next_unique_name(cls, offset, func_name)
 
-        invoke = self._emit_static_invoke(idx_logical, ret_str, args).replace('INVOKE', func_name)
+        invoke = self._emit_static_invoke(idx_logical, args).replace('INVOKE', func_name)
         return invoke
 
     def _emit_get_decl(self, idx_logical, ea, demangled, cls, offset, name_prefix, dtor_class_name):
@@ -1756,7 +1785,7 @@ class DeclarationConverter:
 
     # ---------- public generation ----------
 
-    def generate_declarations(self):
+    def generate_declarations(self, separate=False):
         queue = collections.deque([cls for cls, deg in self.in_degree.items() if deg == 0])
         sorted_classes = []
         while queue:
@@ -1768,6 +1797,7 @@ class DeclarationConverter:
                     queue.append(derived)
 
         class_declarations = []
+        class_files = {}
         class_name_map = {}
 
         for cls in sorted_classes:
@@ -1864,15 +1894,20 @@ class DeclarationConverter:
 
                     full_decls_for_cls.append('\n'.join(decl_lines_full))
 
-            class_declarations.extend(std_decls_for_cls)
-            class_declarations.extend(full_decls_for_cls)
+            class_declarations_for_cls = std_decls_for_cls + full_decls_for_cls
+            class_files[cls] = '\n\n'.join(class_declarations_for_cls)
+            class_declarations.extend(class_declarations_for_cls)
 
         for cls in self.declare:
             if cls not in sorted_classes:
                 self.forward_decls.add(f'class {cls} {{}};')
 
+        forward_declarations = '\n'.join(sorted(self.forward_decls))
+        if separate:
+            return forward_declarations, class_files
+
         return '\n' + \
-               '\n'.join(sorted(self.forward_decls)) + \
+               forward_declarations + \
                '\n\n' + \
                '\n\n'.join(class_declarations)
 
@@ -2352,7 +2387,7 @@ class vdump_t(ida_idaapi.plugin_t):
         if not ida_auto.auto_is_ok():
             print_message('INFO: The analysis is not finished!')
             return
-        
+
         if not ida_hexrays.init_hexrays_plugin():
             print_message('ERROR: Failed to initialize hexrays plugin!\n')
             return
@@ -2413,287 +2448,81 @@ class vdump_t(ida_idaapi.plugin_t):
         created_ts = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
 
         converter = DeclarationConverter()
-        output_h = converter.convert(trees, class_vfuncs)
-        output_h_path = idb_path.with_suffix('.h')
-        header_h = '/*\n'
-        header_h += f' * Generated by vdump [Version {VDUMP_VERSION}] ({created_ts})\n'
-        header_h +=  ' */\n\n'
-        with open(output_h_path, 'w', encoding='utf-8') as f:
-            f.write(header_h + output_h)
-        print_message(f'NOTE: C++ VTable declarations written to {output_h_path}')
+        forward_declarations, class_files = converter.convert(
+            trees,
+            class_vfuncs,
+            separate=True
+        )
 
-        if DUMP_FOR_SOURCE_PYTHON:
-            class PythonEmitter:
-                def __init__(self, conv):
-                    self.conv = conv
-                    self.used_func_names = {}
+        output_dir = idb_path
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-                def _normalize_name(self, cls, offset, base, idx):
-                    bn = (base or '').strip()
-                    if bn.startswith('~') or '::~' in bn:
-                        name = 'destructor'
-                        key = (cls, offset, name)
-                        self.used_func_names.setdefault(key, 0)
-                        self.used_func_names[key] += 1
-                        return name
+        header_comment = '/*\n'
+        header_comment += f' * Generated by vdump [Version {VDUMP_VERSION}] ({created_ts})\n'
+        header_comment += ' */\n\n'
 
-                    name = (bn or '').strip()
-                    if name.startswith('operator'):
-                        name = f'operator_{idx:010}'
-                    name = re.sub(r'[^0-9A-Za-z_]', '_', name)
-                    name = re.sub(r'__+', '_', name).strip('_')
-                    if not name:
-                        name = f'Method_{idx:010}'
+        common_h = header_comment
+        common_h += '#pragma once\n\n'
+        common_h += '#include <cstddef>\n'
+        common_h += '#include <type_traits>\n\n'
+        common_h += '#ifndef VDUMP_ARGUMENT_TYPES_DEFINED\n'
+        common_h += '#define VDUMP_ARGUMENT_TYPES_DEFINED\n'
+        common_h += 'namespace vdump {\n'
+        common_h += 'template <std::size_t Index, typename Type> struct arg {\n'
+        common_h += '    static constexpr std::size_t index = Index;\n'
+        common_h += '    using type = Type;\n'
+        common_h += '};\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Target, typename Default, typename... Overrides>\n'
+        common_h += 'struct selected_arg;\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Target, typename Default>\n'
+        common_h += 'struct selected_arg<Target, Default> { using type = Default; };\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Target, typename Default, typename First, typename... Rest>\n'
+        common_h += 'struct selected_arg<Target, Default, First, Rest...> {\n'
+        common_h += '    using type = std::conditional_t<First::index == Target, typename First::type, typename selected_arg<Target, Default, Rest...>::type>;\n'
+        common_h += '};\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Target, typename Default, typename... Overrides>\n'
+        common_h += 'using arg_type_t = std::type_identity_t<typename selected_arg<Target, Default, Overrides...>::type>;\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Count, typename Type>\n'
+        common_h += 'concept valid_arg_override = requires { Type::index; typename Type::type; } &&\n'
+        common_h += '    (Type::index > 0 && Type::index <= Count);\n'
+        common_h += '\n'
+        common_h += 'template <std::size_t Count, typename... Overrides>\n'
+        common_h += 'concept valid_arg_overrides = (valid_arg_override<Count, Overrides> && ...);\n'
+        common_h += '} // namespace vdump\n'
+        common_h += '#endif\n\n'
+        common_h += forward_declarations
+        common_h += '\n'
 
-                    key = (cls, offset, name)
-                    self.used_func_names.setdefault(key, 0)
-                    self.used_func_names[key] += 1
-                    if self.used_func_names[key] > 1:
-                        name = f'{name}_{self.used_func_names[key]}'
-                    return name
+        common_path = output_dir / '_vdump_common.h'
+        with open(common_path, 'w', encoding='utf-8') as f:
+            f.write(common_h)
+        print_message(f'NOTE: Common C++ declarations written to {common_path}')
 
-                def _is_pure_or_destructor(self, demangled):
-                    d = _sanitize_demangled(demangled)
-                    if d.startswith('~') or '::~' in d or 'destructor' in d:
-                        return 'destructor'
-                    if d.startswith('___cxa_pure_virtual') or d.startswith('__purecall'):
-                        return 'pure'
-                    return None
+        used_file_stems = {}
+        for class_name, class_output in sorted(class_files.items()):
+            file_stem = re.sub(r'[^0-9A-Za-z_.-]+', '_', class_name).strip(' .')
+            if not file_stem:
+                file_stem = 'class'
 
-                def generate(self, class_vfuncs):
-                    lines = []
-                    lines.append('from memory import DataType, Convention')
-                    lines.append('from memory.manager import manager, CustomType')
-                    lines.append('')
-                    lines.append('')
+            original_stem = file_stem
+            if file_stem in used_file_stems and used_file_stems[file_stem] != class_name:
+                file_stem = f'{original_stem}_{hashlib.sha256(class_name.encode()).hexdigest()[:8]}'
+            used_file_stems[file_stem] = class_name
 
-                    indegree = dict(self.conv.in_degree)
-                    queue = collections.deque([cls for cls, deg in indegree.items() if deg == 0])
-                    sorted_classes = []
-                    while queue:
-                        cls = queue.popleft()
-                        sorted_classes.append(cls)
-                        for derived in self.conv.reverse_graph.get(cls, []):
-                            indegree[derived] -= 1
-                            if indegree[derived] == 0:
-                                queue.append(derived)
-
-                    for cls in sorted_classes:
-                        if cls not in class_vfuncs:
-                            continue
-
-                        other_counts = self.conv._collect_key_counts_from_nonzero_offsets(cls)
-
-                        offsets_sorted = sorted(class_vfuncs[cls].items(), key=lambda kv: kv[0])
-
-                        for offset, vfuncs in offsets_sorted:
-                            py_cls_name = f'{cls}_{offset:08X}'
-                            lines.append(f'class {py_cls_name}(CustomType, metaclass=manager):')
-
-                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts.copy())
-                            if not filtered:
-                                lines.append('    pass')
-                                lines.append('')
-                                continue
-
-                            for logical_idx, phys_idx, func_ea, demangled in filtered:
-                                if not demangled:
-                                    continue
-
-                                special = self._is_pure_or_destructor(demangled)
-                                if special == 'destructor':
-                                    lines.append(
-                                        f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                    )
-                                    continue
-                                if special == 'pure':
-                                    lines.append(
-                                        f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                    )
-                                    continue
-
-                                sig = SIGCACHE.get(func_ea, demangled)
-                                base = sig["base"]
-                                method_name = self._normalize_name(cls, offset, base, logical_idx)
-
-                                ret_dt = 'DataType.VOID'
-                                tinfo = None
-                                try:
-                                    decomp = ida_hexrays.decompile(func_ea)
-                                except Exception:
-                                    decomp = None
-                                if decomp:
-                                    tinfo = decomp.type
-                                else:
-                                    f = ida_funcs.get_func(func_ea)
-                                    if f and f.prototype:
-                                        tinfo = f.prototype
-
-                                def _dt_from_tinfo_arg(a):
-                                    try:
-                                        if a.is_ref():
-                                            b = ida_typeinf.tinfo_t(a); b.remove_ref(); a = b
-                                        if a.is_array() or a.is_ptr():
-                                            try:
-                                                if a.is_ptr():
-                                                    pt = a.get_pointed_object()
-                                                    if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
-                                                        return 'DataType.STRING'
-                                            except Exception:
-                                                pass
-                                            return 'DataType.POINTER'
-                                        if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
-                                        if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
-                                        if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
-                                        if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
-                                        if a.is_integral() or a.is_arithmetic():
-                                            sz = a.get_size()
-                                            sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
-                                            if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
-                                            if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
-                                            if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
-                                            if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
-                                            return 'DataType.POINTER'
-                                    except Exception:
-                                        return 'DataType.POINTER'
-                                    return 'DataType.POINTER'
-
-                                arg_dts = []
-                                if tinfo and tinfo.is_func():
-                                    try:
-                                        r = tinfo.get_rettype()
-                                        if r: ret_dt = _dt_from_tinfo_arg(r)
-                                    except Exception:
-                                        ret_dt = 'DataType.VOID'
-                                    try:
-                                        for i in range(1, tinfo.get_nargs()):
-                                            arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
-                                    except Exception:
-                                        arg_dts = []
-                                else:
-                                    arg_dts = ['DataType.POINTER' for _ in sig['args']]
-
-                                args_repr = ', '.join(arg_dts)
-                                lines.append(
-                                    f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
-                                )
-
-                            lines.append('')
-
-                        self.used_func_names = {}
-
-                        for offset, vfuncs in offsets_sorted:
-                            filtered = self.conv._enumerate_vfuncs_filtered(cls, offset, vfuncs, other_counts.copy())
-                            full_list = [(i, i, ea, dem) for i, (ea, dem) in enumerate(vfuncs)]
-                            need_full = self.conv._need_full_class(filtered, full_list)
-                            if not need_full:
-                                continue
-
-                            py_cls_name_full = f'{cls}_Full_{offset:08X}'
-                            lines.append(f'class {py_cls_name_full}(CustomType, metaclass=manager):')
-
-                            if not full_list:
-                                lines.append('    pass')
-                                lines.append('')
-                                continue
-
-                            for logical_idx, phys_idx, func_ea, demangled in full_list:
-                                if not demangled:
-                                    continue
-
-                                special = self._is_pure_or_destructor(demangled)
-                                if special == 'destructor':
-                                    lines.append(
-                                        f'    destructor = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                    )
-                                    continue
-                                if special == 'pure':
-                                    lines.append(
-                                        f'    PureStub_{logical_idx:010} = manager.virtual_function({logical_idx}, [], DataType.VOID, Convention.THISCALL)'
-                                    )
-                                    continue
-
-                                sig = SIGCACHE.get(func_ea, demangled)
-                                base = sig['base']
-                                method_name = self._normalize_name(cls, offset, base, logical_idx)
-
-                                ret_dt = 'DataType.VOID'
-                                tinfo = None
-                                try:
-                                    decomp = ida_hexrays.decompile(func_ea)
-                                except Exception:
-                                    decomp = None
-                                if decomp:
-                                    tinfo = decomp.type
-                                else:
-                                    f = ida_funcs.get_func(func_ea)
-                                    if f and f.prototype:
-                                        tinfo = f.prototype
-
-                                def _dt_from_tinfo_arg(a):
-                                    try:
-                                        if a.is_ref():
-                                            b = ida_typeinf.tinfo_t(a); b.remove_ref(); a = b
-                                        if a.is_array() or a.is_ptr():
-                                            try:
-                                                if a.is_ptr():
-                                                    pt = a.get_pointed_object()
-                                                    if pt and (pt.is_char() or pt.is_decl_char() or pt.is_uchar() or pt.is_decl_uchar()):
-                                                        return 'DataType.STRING'
-                                            except Exception:
-                                                pass
-                                            return 'DataType.POINTER'
-                                        if a.is_void() or a.is_decl_void(): return 'DataType.VOID'
-                                        if a.is_bool() or a.is_decl_bool(): return 'DataType.BOOL'
-                                        if a.is_float() or a.is_decl_float(): return 'DataType.FLOAT'
-                                        if a.is_double() or a.is_decl_double(): return 'DataType.DOUBLE'
-                                        if a.is_integral() or a.is_arithmetic():
-                                            sz = a.get_size()
-                                            sign = a.is_signed() or (not a.is_unsigned() and not a.is_decl_uint())
-                                            if sz == 1: return 'DataType.CHAR' if sign else 'DataType.UCHAR'
-                                            if sz == 2: return 'DataType.SHORT' if sign else 'DataType.USHORT'
-                                            if sz == 4: return 'DataType.INT' if sign else 'DataType.UINT'
-                                            if sz == 8: return 'DataType.LONG_LONG' if sign else 'DataType.ULONG_LONG'
-                                            return 'DataType.POINTER'
-                                    except Exception:
-                                        return 'DataType.POINTER'
-                                    return 'DataType.POINTER'
-
-                                arg_dts = []
-                                if tinfo and tinfo.is_func():
-                                    try:
-                                        r = tinfo.get_rettype()
-                                        if r: ret_dt = _dt_from_tinfo_arg(r)
-                                    except Exception:
-                                        ret_dt = 'DataType.VOID'
-                                    try:
-                                        for i in range(1, tinfo.get_nargs()):
-                                            arg_dts.append(_dt_from_tinfo_arg(tinfo.get_nth_arg(i)))
-                                    except Exception:
-                                        arg_dts = []
-                                else:
-                                    arg_dts = ['DataType.POINTER' for _ in sig['args']]
-
-                                args_repr = ', '.join(arg_dts)
-                                lines.append(
-                                    f'    {method_name} = manager.virtual_function({logical_idx}, [{args_repr}], {ret_dt}, Convention.THISCALL)'
-                                )
-
-                            lines.append('')
-
-                        self.used_func_names = {}
-
-                    return '\n'.join(lines)
-
-            py_emitter = PythonEmitter(converter)
-            output_py = py_emitter.generate(class_vfuncs)
-            output_py_path = idb_path.with_suffix('.py')
-            header_py = '#\n'
-            header_py += f'# Generated by vdump [Version {VDUMP_VERSION}] ({created_ts})\n'
-            header_py += '#\n\n'
-            with open(output_py_path, 'w', encoding='utf-8') as f:
-                f.write(header_py + output_py)
-            print_message(f'NOTE: Python DSL dumped to {output_py_path}')
+            class_path = output_dir / f'{file_stem}.h'
+            class_h = header_comment
+            class_h += '#pragma once\n\n'
+            class_h += '#include "_vdump_common.h"\n\n'
+            class_h += class_output
+            class_h += '\n'
+            with open(class_path, 'w', encoding='utf-8') as f:
+                f.write(class_h)
+            print_message(f'NOTE: C++ VTable declarations written to {class_path}')
 
     @staticmethod
     def main():
